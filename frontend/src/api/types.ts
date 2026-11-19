@@ -1,0 +1,313 @@
+// Mirrors backend/axiom/api/schemas.py exactly — keep in sync.
+// Python `X | None` (without default) -> `X | null`; fields with defaults are still always serialized
+// by FastAPI, so they are typed as required here.
+
+export type Status = "pending" | "running" | "done" | "failed" | "partial";
+export type Coverage = "preserved" | "rewritten" | "merged" | "expandable" | "omitted" | "pending";
+export type UnitKind =
+  | "heading" | "prose" | "equation" | "definition" | "theorem" | "result" | "warning"
+  | "example" | "remark" | "aside" | "figure" | "exercise_ref";
+
+export interface DocumentSummary {
+  id: string;
+  title: string;
+  page_count: number;
+  created_at: string;
+  chapters_total: number;
+  chapters_done: number;
+}
+
+export interface SectionSummary {
+  id: string;
+  number: string; // "1.3"
+  title: string;
+  page_start: number; // 1-based PDF page index
+  page_end: number;
+  status: Status;
+  is_exercises: boolean;
+}
+
+export interface ChapterSummary {
+  id: string;
+  number: number;
+  title: string;
+  page_start: number;
+  page_end: number;
+  status: Status;
+  sections: SectionSummary[];
+}
+
+export interface DocumentDetail extends DocumentSummary {
+  chapters: ChapterSummary[];
+}
+
+export type FlagKind =
+  | "low_confidence" | "ambiguous_notation" | "verification_failed" | "ocr_uncertain" | "info"
+  | "unverified_claim" | "reverted";
+
+export interface Flag {
+  kind: FlagKind;
+  message: string;
+}
+
+export interface UnitSource {
+  block_ids: string[];
+  pages: number[];
+  coverage: Coverage;
+  note: string | null;
+}
+
+export type Level = 1 | 2 | 3;
+
+export interface Unit {
+  id: string;
+  kind: UnitKind;
+  role: string;
+  min_level: Level;
+  text_md: string;
+  fast_md: string | null;
+  deep_md: string | null;
+  latex: string | null;
+  eq_number: string | null;
+  annotation_md: string | null;
+  title: string | null;
+  ai_generated: boolean;
+  source: UnitSource;
+  flags: Flag[];
+  figure_url: string | null;
+  /** independent faithfulness check; null = not applicable / not run yet */
+  verification: "verified" | "flagged" | "reverted" | "unchecked" | null;
+}
+
+export interface ExerciseSummary {
+  id: string;
+  number: string;
+  statement_md: string;
+  page: number;
+}
+
+export interface SectionView {
+  id: string;
+  document_id: string;
+  chapter_number: number;
+  number: string;
+  title: string;
+  status: Status;
+  summary_md: string | null;
+  /** the independent faithfulness check has run for this section */
+  verified: boolean;
+  units: Unit[];
+  exercises: ExerciseSummary[];
+  prev_section_id: string | null;
+  next_section_id: string | null;
+}
+
+export interface SourceBlock {
+  id: string;
+  document_id: string;
+  section_id: string;
+  page: number;
+  bbox: [number, number, number, number];
+  block_type: string;
+  raw_text: string;
+  transcribed_md: string | null;
+  transcription_method: "text_layer" | "vision_ocr" | "none";
+  confidence: number;
+  eq_number: string | null;
+  image_url: string;
+}
+
+export interface StageCount {
+  stage: string;
+  done: number;
+  total: number;
+}
+
+export interface ProgressReport {
+  document_id: string;
+  pages_total: number;
+  sections_total: number;
+  sections_done: number;
+  sections_failed: number;
+  stages: StageCount[];
+  llm_calls: number;
+  llm_cache_hits: number;
+  local_seconds: number;
+  premium_calls: number;
+  premium_tokens: number;
+  jobs: Record<string, unknown>[];
+}
+
+export type AskAction =
+  | "explain" | "simpler" | "steps" | "why" | "physical" | "example" | "notation" | "prerequisites" | "custom";
+
+export interface AskRequest {
+  section_id: string;
+  selection: string;
+  block_ids?: string[];
+  action?: AskAction;
+  question?: string | null;
+  /** "auto" / undefined = the routing in Settings; otherwise a model id such as "claude-code:sonnet" */
+  model?: string;
+}
+
+export interface ContextItem {
+  kind: string;
+  ref: string;
+  title: string;
+}
+
+export interface AskResponse {
+  answer_md: string;
+  model: string;
+  cached: boolean;
+  context_used: ContextItem[];
+}
+
+export interface Exercise {
+  id: string;
+  document_id: string;
+  chapter_number: number;
+  number: string;
+  statement_md: string;
+  page: number;
+  block_ids: string[];
+  hints_available: number;
+  related_section_ids: string[];
+}
+
+export interface HintResponse {
+  level: number;
+  hint_md: string;
+  model: string;
+  cached: boolean;
+}
+
+export interface SearchHit {
+  section_id: string;
+  section_title: string;
+  block_id: string;
+  snippet: string;
+  page: number;
+}
+
+export type Profile = "economy" | "balanced" | "max";
+
+export interface ProcessRequest {
+  chapters: number[];
+  profile: Profile;
+}
+
+export interface ProcessResponse {
+  job_ids: string[];
+}
+
+// ---------------------------------------------------------------- solutions & answer checks
+export interface SolutionPart {
+  label: string;
+  solution_md: string;
+  final_answer_md: string;
+  answer_type: "expression" | "numeric" | "construction" | "proof" | "explanation";
+}
+export interface Solution {
+  exercise_id: string;
+  model: string;
+  /** evidence from two independent solutions: consistent | inconsistent | not_comparable */
+  status: "consistent" | "inconsistent" | "not_comparable";
+  comparison: { label: string; status: string; explanation: string }[];
+  solution: { parts: SolutionPart[] };
+  alternative: { parts: SolutionPart[] } | null;
+}
+export interface AnswerCheck {
+  verdict: "correct" | "partially_correct" | "incorrect" | "cannot_judge";
+  feedback_md: string;
+  first_error_md: string;
+  model: string;
+  reference_status: Solution["status"];
+}
+export interface ExerciseMapItem {
+  id: string;
+  number: string;
+  chapter_number: number;
+  statement_md: string;
+  related_section_ids: string[];
+}
+
+// ---------------------------------------------------------------- mastery checks
+export interface QuizQuestion {
+  id: string;
+  type: "mcq" | "short";
+  prompt_md: string;
+  options: string[];
+  source_units: string[];
+  section_ids: string[];
+}
+export interface Quiz {
+  id: string;
+  scope: "section" | "chapter";
+  scope_id: string;
+  title: string;
+  model: string;
+  questions: QuizQuestion[];
+  dropped_by_blind_check: number;
+}
+export interface QuizResultItem {
+  id: string;
+  score: number;
+  feedback_md: string;
+  correct: number;
+  answer_md: string;
+  explanation_md: string;
+  source_units: string[];
+  section_ids: string[];
+}
+export interface QuizResult {
+  quiz_id: string;
+  score: number;
+  results: QuizResultItem[];
+}
+
+// ---------------------------------------------------------------- visualizations
+export interface Visualization {
+  unit_id: string;
+  title: string;
+  description_md: string;
+  model: string;
+  ai_generated: boolean;
+  reviewed?: boolean | null;
+  review_notes?: string[] | null;
+}
+
+// ---------------------------------------------------------------- models & routing
+export type ModelKind = "local" | "subscription" | "api";
+export interface ModelInfo {
+  id: string;
+  label: string;
+  kind: ModelKind;
+  vision: boolean;
+  available: boolean;
+  detail: string;
+  calls_today: number | null;
+  daily_limit: number | null;
+}
+export type TaskGroup =
+  | "transcribe" | "optimize" | "digest" | "faithfulness"
+  | "ask" | "hint" | "solve" | "check" | "quiz" | "visualize";
+export interface GroupInfo {
+  id: TaskGroup;
+  label: string;
+  heavy: boolean;
+  vision: boolean;
+  help: string;
+  /** what "auto" resolves to right now */
+  auto: string;
+}
+export interface ModelsReport {
+  models: ModelInfo[];
+  groups: GroupInfo[];
+}
+export interface Routing {
+  groups: Record<TaskGroup, string>;
+  premium_default: string;
+  cloud_enabled: boolean;
+}

@@ -1,0 +1,34 @@
+[project]
+name = "axiom"
+version = "0.1.0"
+description = "AXIOM: local-first scientific textbook transformation and learning platform"
+requires-python = ">=3.12"
+dependencies = [
+  "pymupdf>=1.26",
+  "pydantic>=2.9",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "httpx>=0.27",
+  "python-multipart>=0.0.12",
+  "sympy>=1.13",
+  "genanki>=0.13.1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.7"]
+
+[project.scripts]
+axiom = "axiom.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["axiom"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
