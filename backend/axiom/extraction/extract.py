@@ -134,7 +134,11 @@ def _merge_by_y(main: list[PageBlock], extra: list[PageBlock]) -> list[PageBlock
 def extract_chapter(doc_id: str, chapter_id: str, force: bool = False) -> int:
     ch = db.q1("SELECT * FROM chapters WHERE id=?", (chapter_id,))
     sections = db.q("SELECT * FROM sections WHERE chapter_id=? ORDER BY ord", (chapter_id,))
-    if not force and all(s["stage"] != "none" for s in sections):
+    # "already extracted" means the chapter HAS blocks; a stage flag alone is not evidence (a stale
+    # 'transcribed' flag on block-less sections once made whole chapters get skipped and come out empty)
+    have = db.q1("SELECT COUNT(*) n FROM blocks WHERE section_id IN (SELECT id FROM sections WHERE chapter_id=?)",
+                 (chapter_id,))["n"]
+    if not force and have > 0:
         return 0
     by_number = {s["number"]: s for s in sections}
     pdf = open_pdf(doc_id)
@@ -196,6 +200,8 @@ def extract_chapter(doc_id: str, chapter_id: str, force: bool = False) -> int:
                  b.text if b.kind != "exercise" else b.text, b.math_score, b.eq_number or b.exercise_number, chash,
                  int(cont), prev[0] if prev else None, prev[1] if prev else "none", prev[2] if prev else 0.0,
                  prev[3] if prev else db.jdump(b.flags)))
-        for s in sections:
-            c.execute("UPDATE sections SET stage='extracted' WHERE id=? AND stage='none'", (s["id"],))
+        for s in sections:  # fresh blocks: every later stage must run again
+            c.execute("UPDATE sections SET stage='extracted' WHERE id=?", (s["id"],))
+    if not assigned:
+        raise RuntimeError(f"no text blocks found in chapter {ch['number']} (pages {ch['page_start']}–{ch['page_end']})")
     return len(assigned)

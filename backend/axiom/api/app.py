@@ -260,7 +260,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
         i = ids.index(section_id)
         return SectionView(id=s["id"], document_id=s["doc_id"], chapter_number=s["chapter_number"], number=s["number"],
                            title=s["title"], status=s["status"], summary_md=s["digest_md"] or s["summary_md"],
-                           verified=s["stage"] == "verified", units=units, exercises=exercises,
+                           verified=s["stage"] == "verified" and bool(units), units=units, exercises=exercises,
                            prev_section_id=ids[i - 1] if i > 0 else None,
                            next_section_id=ids[i + 1] if i + 1 < len(ids) else None)
 

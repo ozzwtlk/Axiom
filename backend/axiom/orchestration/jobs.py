@@ -100,6 +100,8 @@ def _claim(kinds: tuple[str, ...]) -> dict | None:
             if any(d in failed for d in deps):
                 c.execute("UPDATE jobs SET status='failed', error='upstream dependency failed', updated_at=? WHERE id=?",
                           (_now(), j["id"]))
+                c.execute("UPDATE sections SET status='failed' WHERE id=? AND status NOT IN ('done','partial')",
+                          (j["target_id"],))
                 continue
             if all(d in done for d in deps):
                 c.execute("UPDATE jobs SET status='running', attempts=attempts+1, updated_at=? WHERE id=?", (_now(), j["id"]))

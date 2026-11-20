@@ -118,6 +118,23 @@ def test_extract_chapter_assigns_every_section(tmp_db, carroll):
     assert {"1.1", "1.29", "1.30", "1.31"} <= tags
 
 
+def test_stale_stage_flag_does_not_skip_extraction_and_empty_sections_fail(tmp_db, carroll):
+    """Regression: chapters 3-9 had stage='transcribed' but no blocks → extraction was skipped and every later
+    stage 'succeeded' on empty sections, which the reader then showed as ready (with only a quiz button)."""
+    from axiom.extraction.extract import extract_chapter
+    from axiom.ingestion.pdf import import_pdf
+    from axiom.orchestration.pipeline import EmptySection, optimize_and_verify
+    doc_id = import_pdf(carroll)
+    ch = f"{doc_id}-c3"
+    with db.connect() as c:
+        c.execute("UPDATE sections SET stage='transcribed' WHERE chapter_id=?", (ch,))
+    with pytest.raises(EmptySection):
+        optimize_and_verify(f"{doc_id}-s3.1")
+    assert extract_chapter(doc_id, ch) > 100
+    assert {r["stage"] for r in db.q("SELECT stage FROM sections WHERE chapter_id=?", (ch,))} == {"extracted"}
+    assert extract_chapter(doc_id, ch) == 0  # second call: blocks exist → skipped
+
+
 # ---------------------------------------------------------------- robustness
 def test_malformed_pdf_rejected_gracefully(tmp_db, tmp_path):
     from fastapi.testclient import TestClient

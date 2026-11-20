@@ -13,7 +13,14 @@ from axiom.verification.coverage import audit_section
 log = logging.getLogger("axiom.pipeline")
 
 
+class EmptySection(RuntimeError):
+    pass
+
+
 def optimize_and_verify(section_id: str, profile: str = "economy", should_stop=lambda: False) -> dict:
+    if not db.q1("SELECT COUNT(*) n FROM blocks WHERE section_id=?", (section_id,))["n"]:
+        # never report an empty section as readable: fail loudly so the UI shows it
+        raise EmptySection(f"no source text was extracted for {section_id}; re-run extraction for its chapter")
     stats = optimize_section(section_id, profile, should_stop)
     stats["exercises"] = extract_exercises(section_id)
     report = audit_section(section_id)
