@@ -252,7 +252,9 @@ def _is_heading(r: Row, geo: PageGeometry) -> bool:
     if r.x0 > geo.left - 5:
         return False
     # (font is not required: OCR font assignment for headings is inconsistent across pages)
-    return bool(SECTION_HEAD_RE.match(r.text)) and r.x1 - r.x0 < 0.8 * (geo.right - geo.left)
+    # starts left of the body margin, so it may be long ("6.7 • THE PENROSE PROCESS AND BLACK-HOLE THERMODYNAMICS"
+    # is ~1.2x the column width); only a row running past the right margin is not a heading
+    return bool(SECTION_HEAD_RE.match(r.text)) and r.x1 <= geo.right + 12
 
 
 def _is_body(r: Row, geo: PageGeometry, in_exercises: bool) -> bool:

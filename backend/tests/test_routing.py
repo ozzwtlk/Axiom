@@ -280,3 +280,26 @@ def test_reset_jobs_keeps_done_and_resets_sections(tmp_db):
     assert jobs.reset("d") == {"jobs_removed": 3, "sections_reset": 1}
     assert [r["id"] for r in db.q("SELECT id FROM jobs")] == ["j3"]
     assert jobs.reset(None, include_done=True)["jobs_removed"] == 1
+
+
+def test_chapter_with_empty_section_is_reextracted(tmp_db):
+    from axiom.orchestration import jobs
+    from axiom.storage import db
+    with db.connect() as c:
+        c.execute("INSERT INTO documents(id,title,filename,sha256,page_count,created_at) VALUES ('d','T','f','h',1,'x')")
+        c.execute("INSERT INTO chapters(id,doc_id,number,title,page_start,page_end) VALUES ('c1','d',1,'t',1,2)")
+        for o in (0, 1):
+            c.execute("INSERT INTO sections(id,doc_id,chapter_id,number,title,ord,page_start,page_end)"
+                      " VALUES (?,?,'c1',?,'t',?,1,2)", (f"s{o}", "d", f"1.{o}", o))
+        c.execute("INSERT INTO blocks(id,doc_id,section_id,ord,page,x0,y0,x1,y1,block_type,raw_text,content_hash)"
+                  " VALUES ('b','d','s0',0,1,0,0,1,1,'paragraph','x','h')")  # s1 has no block
+        c.execute("INSERT INTO jobs(id,doc_id,kind,target_id,status,created_at,updated_at)"
+                  " VALUES ('old','d','optimize','s1','failed','x','x')")
+    jobs.enqueue_document("d", [1])
+    assert db.q1("SELECT 1 FROM jobs WHERE kind='reextract' AND target_id='c1'")
+    assert not db.q1("SELECT 1 FROM jobs WHERE kind='extract'")
+    assert not db.q1("SELECT 1 FROM jobs WHERE id='old'")  # stale failed job replaced
+    # every transcribe job waits for the re-extraction
+    ex = db.q1("SELECT id FROM jobs WHERE kind='reextract'")["id"]
+    for r in db.q("SELECT depends_on FROM jobs WHERE kind='transcribe'"):
+        assert ex in r["depends_on"]

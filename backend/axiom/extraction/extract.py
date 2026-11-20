@@ -140,6 +140,11 @@ def extract_chapter(doc_id: str, chapter_id: str, force: bool = False) -> int:
                  (chapter_id,))["n"]
     if not force and have > 0:
         return 0
+    before: dict[str, tuple[frozenset, str, str]] = {}
+    if force:  # per section: its blocks, stage and status, to find out which sections a re-extraction changed
+        for s in sections:
+            hs = frozenset(r["content_hash"] for r in db.q("SELECT content_hash FROM blocks WHERE section_id=?", (s["id"],)))
+            before[s["id"]] = (hs, s["stage"], s["status"])
     by_number = {s["number"]: s for s in sections}
     pdf = open_pdf(doc_id)
     current = sections[0]
@@ -200,8 +205,16 @@ def extract_chapter(doc_id: str, chapter_id: str, force: bool = False) -> int:
                  b.text if b.kind != "exercise" else b.text, b.math_score, b.eq_number or b.exercise_number, chash,
                  int(cont), prev[0] if prev else None, prev[1] if prev else "none", prev[2] if prev else 0.0,
                  prev[3] if prev else db.jdump(b.flags)))
-        for s in sections:  # fresh blocks: every later stage must run again
-            c.execute("UPDATE sections SET stage='extracted' WHERE id=?", (s["id"],))
+        for s in sections:
+            after = frozenset(r["content_hash"] for r in c.execute("SELECT content_hash FROM blocks WHERE section_id=?",
+                                                                    (s["id"],)))
+            if force and s["id"] in before and before[s["id"]][0] == after:
+                continue  # same blocks as before: keep its finished stages
+            # fresh blocks: every later stage of this section must run again (its finished jobs go back to the queue)
+            c.execute("UPDATE sections SET stage='extracted', status='pending' WHERE id=?", (s["id"],))
+            if force:
+                c.execute("UPDATE jobs SET status='pending', attempts=0, error=NULL, worker=NULL WHERE target_id=?"
+                          " AND kind IN ('transcribe','optimize','verify')", (s["id"],))
     if not assigned:
         raise RuntimeError(f"no text blocks found in chapter {ch['number']} (pages {ch['page_start']}–{ch['page_end']})")
     return len(assigned)

@@ -63,7 +63,7 @@ def enqueue_document(doc_id: str, chapter_numbers: list[int], profile: str = "ec
             ch = c.execute("SELECT * FROM chapters WHERE doc_id=? AND number=?", (doc_id, n)).fetchone()
             if not ch:
                 continue
-            ex = _add(c, doc_id, "extract", ch["id"], [], profile, model, parallel)
+            ex = _extract_job(c, doc_id, ch, profile, model, parallel)
             ids.append(ex)
             for s in c.execute("SELECT * FROM sections WHERE chapter_id=? ORDER BY ord", (ch["id"],)).fetchall():
                 tr = _add(c, doc_id, "transcribe", s["id"], [ex], profile, model, parallel)
@@ -79,6 +79,22 @@ def enqueue_document(doc_id: str, chapter_numbers: list[int], profile: str = "ec
             nums = ",".join(str(n) for n in sorted(chapter_numbers))
             ids.append(_add(c, doc_id, "reconcile", f"{doc_id}@{nums}", soft, profile, model, False))
     return ids
+
+
+def _extract_job(c, doc_id: str, ch, profile: str, model: str | None, parallel: bool) -> str:
+    """The job that makes the chapter's blocks. A chapter that already has blocks but with sections that got none
+    (their heading was not recognised once, so the text sits in the previous section) is extracted again: a
+    "reextract" job replaces the stale queue entries of the chapter, so nothing runs against half-old blocks."""
+    secs = [s["id"] for s in c.execute("SELECT id FROM sections WHERE chapter_id=?", (ch["id"],))]
+    marks = ",".join("?" * len(secs)) or "NULL"
+    have = {r["section_id"] for r in c.execute(f"SELECT DISTINCT section_id FROM blocks WHERE section_id IN ({marks})", secs)}
+    if not have or len(have) == len(secs):
+        return _add(c, doc_id, "extract", ch["id"], [], profile, model, parallel)
+    c.execute(f"DELETE FROM jobs WHERE status IN ('pending','running','failed','cancelled') AND target_id IN ({marks})"
+              " AND kind IN ('transcribe','optimize','verify')", secs)
+    c.execute("DELETE FROM jobs WHERE kind='reextract' AND target_id=?", (ch["id"],))
+    log.info("chapter %s has sections without blocks: re-extracting", ch["number"])
+    return _add(c, doc_id, "reextract", ch["id"], [], profile, model, parallel)
 
 
 def cancel(job_id: str) -> None:
@@ -204,8 +220,8 @@ def _run_kind(job: dict, kind: str, target: str, profile: str, should_stop) -> N
     from axiom.transformations.transcribe import transcribe_section
     if kind == "import":
         result = _import_from_inbox(target)
-    elif kind == "extract":
-        result = {"blocks": extract_chapter(job["doc_id"], target)}
+    elif kind in ("extract", "reextract"):
+        result = {"blocks": extract_chapter(job["doc_id"], target, force=(kind == "reextract"))}
     elif kind == "transcribe":
         with db.connect() as c:
             c.execute("UPDATE sections SET status='running' WHERE id=? AND status NOT IN ('done','partial')", (target,))
@@ -263,12 +279,12 @@ def start_workers(n_transcribe: int = 1, n_optimize: int | None = None, idle_exi
     threads = []
     from axiom.config import settings
     extra = max(0, settings.parallel_workers)  # only ever run jobs of "parallel" runs (premium model)
-    for kinds in (("import", "extract", "transcribe"), ("optimize", "verify", "extract")):  # no reconcile: serial
+    for kinds in (("import", "extract", "reextract", "transcribe"), ("optimize", "verify", "extract", "reextract")):  # no reconcile: serial
         for _ in range(extra):
             t = threading.Thread(target=_worker, args=(kinds, idle_exit, True), daemon=True)
             t.start()
             threads.append(t)
-    for kinds, n in ((("import", "extract", "transcribe"), n_transcribe), (("optimize", "verify", "extract", "reconcile"), n_optimize)):
+    for kinds, n in ((("import", "extract", "reextract", "transcribe"), n_transcribe), (("optimize", "verify", "extract", "reextract", "reconcile"), n_optimize)):
         for _ in range(n):
             t = threading.Thread(target=_worker, args=(kinds, idle_exit), daemon=True)
             t.start()
