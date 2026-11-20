@@ -12,6 +12,7 @@
 #   ./axiom setup-worker <server-url> [name]   make this PC/laptop a computing machine (asks for the token)
 #   ./axiom worker                        connect to the server (+ start the local model if there is one)
 #   ./axiom migrate-to-server <user@host:/path/to/server-data>   copy your existing books to the server
+#   ./axiom ship-server [-p port] <user@pi> [dir]   build the server image here (arm64), install it on the Pi
 #
 # Services keep running in the background after this script exits; `./axiom stop` ends them.
 # Already-running services (started by hand or by a previous launch) are reused, never restarted.
@@ -217,6 +218,51 @@ PY
   say "      docker compose up -d   — and on this PC: ./axiom setup-worker http://<server>:<port>"
 }
 
+cmd_ship_server() {
+  local port="" pos=() platform=${AXIOM_SERVER_PLATFORM:-linux/arm64}
+  while (( $# )); do
+    case "$1" in
+      -p|--port) port=${2:-}; shift 2 || die "-p needs a port number" ;;
+      -p*)       port=${1#-p}; shift ;;
+      --port=*)  port=${1#--port=}; shift ;;
+      *)         pos+=("$1"); shift ;;
+    esac
+  done
+  local target=${pos[0]:-} dir=${pos[1]:-axiom}
+  [[ -n "$target" ]] || die "usage: ./axiom ship-server [-p ssh-port] <user@pi-address> [directory on the Pi, default: ~/axiom]"
+  [[ -z "$port" || "$port" =~ ^[0-9]+$ ]] || die "bad ssh port: $port"
+  local SSH=(ssh) SCP=(scp -q)
+  if [[ -n "$port" ]]; then SSH+=(-p "$port"); SCP+=(-P "$port"); fi
+  docker buildx version >/dev/null 2>&1 \
+    || die "docker buildx is missing — install it (Arch/CachyOS: sudo pacman -S docker-buildx)"
+  if [[ "$platform" == linux/arm64 && "$(uname -m)" != aarch64 && ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]]; then
+    die "this PC cannot build ARM images yet — install QEMU emulation:
+     sudo pacman -S qemu-user-static qemu-user-static-binfmt && sudo systemctl restart systemd-binfmt
+     (other distros: docker run --privileged --rm tonistiigi/binfmt --install arm64)"
+  fi
+  "${SSH[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$target" 'docker version --format "{{.Server.Arch}}"' >/dev/null \
+    || die "cannot run docker on $target over ssh (set up an ssh key, and add the user to the docker group on the Pi)"
+
+  say "Building the server image for $platform (first build takes a while under emulation)…"
+  local tar="$RUN/axiom-server-image.tar"
+  docker buildx build --platform "$platform" -f "$ROOT/docker/Dockerfile" -t axiom-server:latest \
+    --output "type=docker,dest=$tar" "$ROOT" || die "image build failed"
+  say "Sending the image to $target ($(du -h "$tar" | cut -f1))…"
+  gzip -c "$tar" | "${SSH[@]}" "$target" 'gunzip | docker load' || die "docker load on $target failed"
+  rm -f "$tar"
+
+  say "Installing the compose file in ~/$dir on $target…"
+  "${SSH[@]}" "$target" "mkdir -p '$dir'"
+  "${SCP[@]}" "$ROOT/deploy/pi/docker-compose.yml" "$target:$dir/docker-compose.yml"
+  "${SCP[@]}" "$ROOT/.env.example" "$target:$dir/.env.example"
+  if "${SSH[@]}" "$target" "grep -qE '^AXIOM_TOKEN=.{16,}' '$dir/.env' 2>/dev/null"; then
+    "${SSH[@]}" "$target" "cd '$dir' && docker compose up -d" && say "server (re)started on $target"
+  else
+    say "next, on the Pi:  cd ~/$dir && cp .env.example .env && nano .env   (AXIOM_TOKEN: ./axiom new-token)"
+    say "                  docker compose up -d"
+  fi
+}
+
 cmd_install_desktop() {
   local f="$HOME/.local/share/applications/axiom.desktop"
   mkdir -p "$(dirname "$f")"
@@ -242,11 +288,12 @@ case "${1:-start}" in
   setup-worker)    shift; cmd_setup_worker "$@" ;;
   new-token)       cmd_new_token ;;
   migrate-to-server) shift; cmd_migrate "$@" ;;
+  ship-server)     shift; cmd_ship_server "$@" ;;
   stop)            cmd_stop ;;
   restart)         cmd_stop; sleep 2; default_start ;;
   status)          cmd_status ;;
   logs)            tail -n 30 -F "$LOGS"/*.log ;;
   install-desktop) cmd_install_desktop ;;
-  -h|--help|help)  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help)  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
   *)               die "unknown command '$1' (try ./axiom help)" ;;
 esac

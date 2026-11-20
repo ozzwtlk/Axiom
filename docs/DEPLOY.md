@@ -22,6 +22,22 @@
 
 ## 1. Server (Raspberry Pi, Docker)
 
+### Option A — build on the PC, the Pi only runs it (recommended)
+
+One-time on the PC: `sudo pacman -S docker-buildx qemu-user-static qemu-user-static-binfmt` (lets an x86 PC build
+ARM images), and an ssh key for the Pi (`ssh-copy-id pi@<pi-address>`; the Pi user must be in the `docker` group).
+
+```bash
+./axiom ship-server pi@<pi-address>          # builds the arm64 image, docker-loads it on the Pi, copies the compose file
+```
+
+On the Pi, once: `cd ~/axiom && cp .env.example .env`, put a token in `.env` (`./axiom new-token` on the PC prints
+one), then `docker compose up -d`. Later updates are just `git pull && ./axiom ship-server pi@<pi-address>` on the
+PC, which restarts the server by itself. No source code, Node or Python is needed on the Pi; only
+`deploy/pi/docker-compose.yml` and `.env` end up there.
+
+### Option B — build on the Pi
+
 ```bash
 git clone <this repo> axiom && cd axiom      # or copy the repo to the Pi
 cp .env.example .env
