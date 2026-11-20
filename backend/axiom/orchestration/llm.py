@@ -83,20 +83,20 @@ def get_adapter(model: str) -> ChatAdapter:
         elif mid.startswith("claude-code:"):
             from axiom.model_adapters.cli_agents import ClaudeCodeAdapter
             ad = ClaudeCodeAdapter(mid.split(":", 1)[1], timeout=settings.llm_timeout_s)
-            _sems[mid] = threading.Semaphore(settings.subscription_concurrency)
+            _sems[mid] = threading.Semaphore(max(settings.subscription_concurrency, settings.parallel_concurrency))
         elif mid.startswith("codex:"):
             from axiom.model_adapters.cli_agents import CodexAdapter
             m = mid.split(":", 1)[1]
             ad = CodexAdapter(None if m == "default" else m, timeout=settings.llm_timeout_s)
-            _sems[mid] = threading.Semaphore(settings.subscription_concurrency)
+            _sems[mid] = threading.Semaphore(max(settings.subscription_concurrency, settings.parallel_concurrency))
         elif mid == "api:anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
             from axiom.model_adapters.anthropic import AnthropicAdapter
             ad = AnthropicAdapter(os.environ["ANTHROPIC_API_KEY"], settings.premium_model)
-            _sems[mid] = threading.Semaphore(settings.premium_concurrency)
+            _sems[mid] = threading.Semaphore(max(settings.premium_concurrency, settings.parallel_concurrency))
         elif mid == "api:openai" and os.environ.get("OPENAI_API_KEY"):
             ad = OpenAICompatAdapter("https://api.openai.com/v1", os.environ.get("AXIOM_OPENAI_MODEL", "gpt-5"),
                                      "premium", api_key=os.environ["OPENAI_API_KEY"], local_llamacpp=False)
-            _sems[mid] = threading.Semaphore(settings.premium_concurrency)
+            _sems[mid] = threading.Semaphore(max(settings.premium_concurrency, settings.parallel_concurrency))
         else:
             raise BudgetExceeded(f"model {model!r} is not available")
         _adapters[mid] = ad

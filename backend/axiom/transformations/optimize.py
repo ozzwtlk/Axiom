@@ -165,9 +165,15 @@ def _context(sec, doc_id: str, prev_tail: str | None) -> str:
     prev = db.q("SELECT number, title, summary_md FROM sections WHERE chapter_id=? AND ord<? AND summary_md IS NOT NULL"
                 " ORDER BY ord DESC LIMIT 2", (sec["chapter_id"], sec["ord"]))
     # notation from *earlier* sections only (deterministic context -> stable cache keys)
+    # In a parallel run (premium model) chapters are rewritten concurrently, so an earlier chapter may be half done:
+    # its notation is left out and the context depends on this chapter's own chain only (still deterministic).
+    from axiom.orchestration import models
+    earlier_ch = "c.number = ?" if models.processing_parallel.get() else "(c.number < ? OR c.number = ?)"
     earlier = [r["id"] for r in db.q(
         "SELECT s.id FROM sections s JOIN chapters c ON c.id=s.chapter_id WHERE s.doc_id=? AND"
-        " (c.number < ? OR (c.number = ? AND s.ord < ?))", (doc_id, ch["number"], ch["number"], sec["ord"]))]
+        f" ({earlier_ch} AND (c.number < ? OR s.ord < ?))",
+        (doc_id, *((ch["number"],) if models.processing_parallel.get() else (ch["number"], ch["number"])),
+         ch["number"], sec["ord"]))]
     # latest definition of each symbol by *book position* (row ids change when a section is re-optimized, so they
     # may only break ties inside one section, where insertion order is deterministic)
     notation = db.q(

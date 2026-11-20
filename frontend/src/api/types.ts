@@ -149,6 +149,8 @@ export interface AskRequest {
   question?: string | null;
   /** "auto" / undefined = the routing in Settings; otherwise a model id such as "claude-code:sonnet" */
   model?: string;
+  /** concurrent chapters/sections; the server rejects it for the local model */
+  parallel?: boolean;
 }
 
 export interface ContextItem {

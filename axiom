@@ -9,6 +9,7 @@
 #
 # With a server (e.g. a Raspberry Pi running docker compose):
 #   ./axiom new-token                     print a random shared secret for the server's .env
+#   ./axiom reset-jobs [doc_id] [--all]   drop pending/running/failed jobs on the server (--all: finished ones too)
 #   ./axiom setup-worker <server-url> [name]   make this PC/laptop a computing machine (asks for the token)
 #   ./axiom worker                        connect to the server (+ start the local model if there is one)
 #   ./axiom migrate-to-server <user@host:/path/to/server-data>   copy your existing books to the server
@@ -107,6 +108,16 @@ stop_one() {  # only stops processes this launcher started (pid file), and their
     say "stopped $name (pid $pid)"
   fi
   rm -f "$pidf"
+}
+
+cmd_reset_jobs() {  # ./axiom reset-jobs [doc_id] [--all]   clear the queue on the server (or this PC)
+  local doc="" all=false a url
+  for a in "$@"; do [[ "$a" == "--all" ]] && all=true || doc="$a"; done
+  if [[ -f "$WORKER_ENV" ]]; then load_worker_env; url="$AXIOM_SERVER_URL"; else url="$APP_URL"; fi
+  warn "stop the computing machines first (./axiom stop on each), or a running job keeps working."
+  curl -fsS -m 20 -X POST "${url}/api/jobs/reset?include_done=${all}${doc:+&doc_id=$doc}" || die "cannot reach ${url}"
+  echo
+  say "queue cleared on ${url}. Start the machines again (./axiom) and queue the chapters from the reader."
 }
 
 cmd_stop() {
@@ -289,6 +300,7 @@ case "${1:-start}" in
   new-token)       cmd_new_token ;;
   migrate-to-server) shift; cmd_migrate "$@" ;;
   ship-server)     shift; cmd_ship_server "$@" ;;
+  reset-jobs)      shift; cmd_reset_jobs "$@" ;;
   stop)            cmd_stop ;;
   restart)         cmd_stop; sleep 2; default_start ;;
   status)          cmd_status ;;

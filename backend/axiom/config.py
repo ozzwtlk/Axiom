@@ -39,6 +39,9 @@ class Settings:
     premium_model: str = field(default_factory=lambda: _env("AXIOM_PREMIUM_MODEL", "claude-sonnet-5-5"))
     premium_concurrency: int = field(default_factory=lambda: int(_env("AXIOM_PREMIUM_CONCURRENCY", "1")))
     subscription_concurrency: int = field(default_factory=lambda: int(_env("AXIOM_SUBSCRIPTION_CONCURRENCY", "2")))
+    # parallel processing runs (premium model only): extra job threads per pool and concurrent calls per model
+    parallel_workers: int = field(default_factory=lambda: int(_env("AXIOM_PARALLEL_WORKERS", "3")))
+    parallel_concurrency: int = field(default_factory=lambda: int(_env("AXIOM_PARALLEL_CONCURRENCY", "6")))
     render_dpi: int = field(default_factory=lambda: int(_env("AXIOM_RENDER_DPI", "200")))
     llm_timeout_s: float = field(default_factory=lambda: float(_env("AXIOM_LLM_TIMEOUT", "1800")))
 

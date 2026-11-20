@@ -30,6 +30,7 @@ log = logging.getLogger("axiom.api")
 class ProcessRequest(BaseModel):
     chapters: list[int]
     profile: str = "economy"
+    parallel: bool = False  # run chapters/sections concurrently; only with a premium model
     model: str | None = None  # one model for transcription, rewriting and checks of this run; None = Settings
 
 
@@ -252,7 +253,18 @@ def create_app(start_worker: bool = True) -> FastAPI:
         model = None if body.model in (None, "", "auto") else body.model
         if model and role() != "server" and model not in {m["id"] for m in models.catalog() if m["vision"]}:
             raise HTTPException(400, f"{model} cannot process scans (needs a model that reads images)")
-        return {"job_ids": jobs.enqueue_document(doc_id, body.chapters, body.profile, model)}
+        if body.parallel and (not model or models.kind(model) == "local"):
+            raise HTTPException(400, "parallel processing needs a premium model (Claude Code, Codex or an API); "
+                                     "the local model has a single GPU")
+        return {"job_ids": jobs.enqueue_document(doc_id, body.chapters, body.profile, model, body.parallel)}
+
+    @app.post("/api/jobs/reset")
+    def reset_jobs(doc_id: str | None = None, include_done: bool = False):
+        """Clean slate for the queue (e.g. after a code update): drops pending / running / failed / cancelled jobs
+        and puts their sections back to 'pending'. Finished work (blocks, units, caches) is kept, so queueing the
+        chapters again skips what is done. `include_done` also forgets finished jobs. Stop the workers first."""
+        from axiom.orchestration import jobs
+        return jobs.reset(doc_id, include_done)
 
     @app.post("/api/documents/{doc_id}/cancel")
     def cancel(doc_id: str):

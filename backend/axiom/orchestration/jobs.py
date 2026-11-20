@@ -4,6 +4,7 @@ Task contract (one row per job): kind, target_id, depends_on (job ids), profile,
 status ∈ pending | running | done | failed | cancelled, progress JSON, error.
 
 Job graph per chapter:  extract(chapter) → transcribe(section_i) → optimize(section_i) → verify(section_i)
+Parallel runs end with one reconcile job: book-wide notation check, serial re-optimize of conflicts.
 optimize(section_i) also depends on optimize(section_{i-1}) because it reuses its summary as context.
 Transcription jobs of different sections are independent and may run concurrently.
 
@@ -32,39 +33,51 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _add(c, doc_id: str, kind: str, target: str, deps: list[str], profile: str, model: str | None = None) -> str:
+def _add(c, doc_id: str, kind: str, target: str, deps: list[str], profile: str, model: str | None = None,
+         parallel: bool = False) -> str:
     existing = c.execute("SELECT id, status FROM jobs WHERE kind=? AND target_id=? AND status IN ('pending','running','done')",
                          (kind, target)).fetchone()
     if existing:
         return existing["id"]
     jid = uuid.uuid4().hex[:12]
-    c.execute("INSERT INTO jobs(id,doc_id,kind,target_id,status,depends_on,profile,model,created_at,updated_at)"
-              " VALUES (?,?,?,?,?,?,?,?,?,?)",
-              (jid, doc_id, kind, target, "pending", json.dumps(deps), profile, model, _now(), _now()))
+    c.execute("INSERT INTO jobs(id,doc_id,kind,target_id,status,depends_on,profile,model,parallel,created_at,updated_at)"
+              " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+              (jid, doc_id, kind, target, "pending", json.dumps(deps), profile, model, int(parallel), _now(), _now()))
     return jid
 
 
 def enqueue_document(doc_id: str, chapter_numbers: list[int], profile: str = "economy",
-                     model: str | None = None) -> list[str]:
-    """`model`: one model for all bulk stages of this run (e.g. "claude-code:haiku"); None = routing settings."""
+                     model: str | None = None, parallel: bool = False) -> list[str]:
+    """`model`: one model for all bulk stages of this run (e.g. "claude-code:haiku"); None = routing settings.
+    `parallel` (premium model only, enforced by the caller): the optimize chain is per chapter instead of one chain
+    across the book, so chapters are rewritten concurrently, and extra job threads pick these jobs up. Trade-off:
+    a chapter's notation context may then include a still-moving earlier chapter (less stable cache keys)."""
     ids: list[str] = []
     # optimize jobs form ONE chain across chapters: a section's context (summaries, notation) comes from all earlier
     # sections of the book, so it must not depend on how far a parallel chapter has got (stable cache keys)
     prev_opt = None
     with db.connect() as c:
         for n in sorted(chapter_numbers):
+            if parallel:
+                prev_opt = None
             ch = c.execute("SELECT * FROM chapters WHERE doc_id=? AND number=?", (doc_id, n)).fetchone()
             if not ch:
                 continue
-            ex = _add(c, doc_id, "extract", ch["id"], [], profile, model)
+            ex = _add(c, doc_id, "extract", ch["id"], [], profile, model, parallel)
             ids.append(ex)
             for s in c.execute("SELECT * FROM sections WHERE chapter_id=? ORDER BY ord", (ch["id"],)).fetchall():
-                tr = _add(c, doc_id, "transcribe", s["id"], [ex], profile, model)
-                op = _add(c, doc_id, "optimize", s["id"], [tr] + (["~" + prev_opt] if prev_opt else []), profile, model)
-                vf = _add(c, doc_id, "verify", s["id"], [op], profile, model)
+                tr = _add(c, doc_id, "transcribe", s["id"], [ex], profile, model, parallel)
+                op = _add(c, doc_id, "optimize", s["id"], [tr] + (["~" + prev_opt] if prev_opt else []), profile, model, parallel)
+                vf = _add(c, doc_id, "verify", s["id"], [op], profile, model, parallel)
                 ids += [tr, op, vf]
                 prev_opt = op
                 c.execute("UPDATE sections SET status='pending' WHERE id=? AND status NOT IN ('done','partial')", (s["id"],))
+        if parallel and ids:
+            # after everything of this run: check the notation book-wide and re-optimize contradicting sections.
+            # Not "parallel": runs on a main optimize thread, serially, with the full book-wide context.
+            soft = ["~" + i for i in ids]
+            nums = ",".join(str(n) for n in sorted(chapter_numbers))
+            ids.append(_add(c, doc_id, "reconcile", f"{doc_id}@{nums}", soft, profile, model, False))
     return ids
 
 
@@ -79,6 +92,19 @@ def cancel_document(doc_id: str) -> int:
     for r in rows:
         cancel(r["id"])
     return len(rows)
+
+
+def reset(doc_id: str | None = None, include_done: bool = False) -> dict:
+    where = "" if not doc_id else " AND doc_id=?"
+    args = (doc_id,) if doc_id else ()
+    statuses = "('pending','running','failed','cancelled'" + (",'done'" if include_done else "") + ")"
+    with db.connect() as c:
+        # imports waiting in the inbox are not part of a document's run
+        n = c.execute(f"DELETE FROM jobs WHERE status IN {statuses} AND kind!='import'{where}", args).rowcount
+        s = c.execute("UPDATE sections SET status='pending' WHERE status IN ('running','failed')"
+                      + (" AND doc_id=?" if doc_id else ""), args).rowcount
+    _cancel_requested.clear()
+    return {"jobs_removed": n, "sections_reset": s}
 
 
 # name of this machine when it runs as a worker for a server (None: all-in-one, this process owns the queue)
@@ -103,7 +129,8 @@ def recover() -> int:
     return n
 
 
-_GROUP_OF_KIND = {"transcribe": "transcribe", "optimize": "optimize", "verify": "faithfulness"}
+_GROUP_OF_KIND = {"transcribe": "transcribe", "optimize": "optimize", "verify": "faithfulness",
+                  "reconcile": "optimize"}
 
 
 def can_run(job, selected: str = "auto") -> bool:
@@ -122,7 +149,7 @@ def can_run(job, selected: str = "auto") -> bool:
 _claim_lock = threading.Lock()
 
 
-def _claim(kinds: tuple[str, ...]) -> dict | None:
+def _claim(kinds: tuple[str, ...], parallel_only: bool = False) -> dict | None:
     with _claim_lock, db.connect() as c:
         done = {r["id"] for r in c.execute("SELECT id FROM jobs WHERE status='done'")}
         failed = {r["id"] for r in c.execute("SELECT id FROM jobs WHERE status IN ('failed','cancelled')")}
@@ -132,6 +159,8 @@ def _claim(kinds: tuple[str, ...]) -> dict | None:
         selected = (sel_row["value"] if sel_row else None) or "auto"
         for j in c.execute(f"SELECT * FROM jobs WHERE status='pending' AND kind IN ({','.join('?' * len(kinds))})"
                            " ORDER BY created_at, rowid", kinds).fetchall():
+            if parallel_only and not j["parallel"]:
+                continue
             all_deps = json.loads(j["depends_on"])
             deps = [d for d in all_deps if not d.startswith("~")]
             soft = [d[1:] for d in all_deps if d.startswith("~")]
@@ -161,9 +190,11 @@ def _run(job: dict) -> None:
     kind, target, profile = job["kind"], job["target_id"], job["profile"]
     from axiom.orchestration import models
     token = models.processing_model.set(job.get("model"))  # the model chosen for this processing run
+    ptoken = models.processing_parallel.set(bool(job.get("parallel")))
     try:
         _run_kind(job, kind, target, profile, should_stop)
     finally:
+        models.processing_parallel.reset(ptoken)
         models.processing_model.reset(token)
 
 
@@ -181,6 +212,10 @@ def _run_kind(job: dict, kind: str, target: str, profile: str, should_stop) -> N
         result = transcribe_section(target, profile, should_stop)
     elif kind == "optimize":
         result = optimize_and_verify(target, profile, should_stop)
+    elif kind == "reconcile":
+        from axiom.verification.notation import reconcile
+        doc, _, nums = target.partition("@")
+        result = reconcile(doc, [int(x) for x in nums.split(",") if x], profile, should_stop)
     elif kind == "verify":
         from axiom.orchestration.pipeline import verify_and_finalize
         result = verify_and_finalize(target, profile, should_stop)
@@ -191,9 +226,9 @@ def _run_kind(job: dict, kind: str, target: str, profile: str, should_stop) -> N
                   (json.dumps(result), _now(), job["id"]))
 
 
-def _worker(kinds: tuple[str, ...], idle_exit: bool) -> None:
+def _worker(kinds: tuple[str, ...], idle_exit: bool, parallel_only: bool = False) -> None:
     while not _stop.is_set():
-        job = _claim(kinds)
+        job = _claim(kinds, parallel_only)
         if not job:
             if idle_exit and not db.q("SELECT 1 FROM jobs WHERE status IN ('pending','running') LIMIT 1"):
                 return
@@ -226,7 +261,14 @@ def start_workers(n_transcribe: int = 1, n_optimize: int | None = None, idle_exi
     recover()
     _stop.clear()
     threads = []
-    for kinds, n in ((("import", "extract", "transcribe"), n_transcribe), (("optimize", "verify", "extract"), n_optimize)):
+    from axiom.config import settings
+    extra = max(0, settings.parallel_workers)  # only ever run jobs of "parallel" runs (premium model)
+    for kinds in (("import", "extract", "transcribe"), ("optimize", "verify", "extract")):  # no reconcile: serial
+        for _ in range(extra):
+            t = threading.Thread(target=_worker, args=(kinds, idle_exit, True), daemon=True)
+            t.start()
+            threads.append(t)
+    for kinds, n in ((("import", "extract", "transcribe"), n_transcribe), (("optimize", "verify", "extract", "reconcile"), n_optimize)):
         for _ in range(n):
             t = threading.Thread(target=_worker, args=(kinds, idle_exit), daemon=True)
             t.start()

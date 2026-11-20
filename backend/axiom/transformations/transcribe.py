@@ -164,7 +164,9 @@ def transcribe_section(section_id: str, profile: str = "economy", should_stop=la
             raise InterruptedError("cancelled")
         return _transcribe_one(b, doc_id, section_id, profile)
 
-    with ThreadPoolExecutor(max_workers=max(1, settings.local_concurrency)) as ex:
+    from axiom.orchestration import models
+    par = models.processing_parallel.get() and models.processing_model.get() not in (None, "auto", "local")
+    with ThreadPoolExecutor(max_workers=max(1, settings.parallel_concurrency if par else settings.local_concurrency)) as ex:
         for method, cached in ex.map(work, todo):
             stats["vision" if method == "vision_ocr" else "text_layer"] += 1
             stats["cached"] += int(cached)

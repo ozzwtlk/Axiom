@@ -36,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("import"); p.add_argument("pdf"); p.add_argument("--title")
     p = sub.add_parser("process"); p.add_argument("doc_id"); p.add_argument("--chapters"); p.add_argument("--profile", default="economy")
+    p.add_argument("--model"); p.add_argument("--parallel", action="store_true", help="premium --model only")
     p = sub.add_parser("stage"); p.add_argument("doc_id"); p.add_argument("--chapters")
     p.add_argument("--until", default="verify", choices=["extract", "transcribe", "optimize", "verify"])
     p.add_argument("--force-extract", action="store_true"); p.add_argument("--profile", default="economy")
@@ -85,7 +86,10 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {s['number']} verify:", verify_and_finalize(s["id"], a.profile), flush=True)
     elif a.cmd == "process":
         from axiom.orchestration import jobs
-        ids = jobs.enqueue_document(a.doc_id, [c["number"] for c in _chapters(a.doc_id, a.chapters)], a.profile)
+        if a.parallel and (not a.model or a.model in ("auto", "local")):
+            raise SystemExit("--parallel needs a premium --model, e.g. claude-code:sonnet")
+        ids = jobs.enqueue_document(a.doc_id, [c["number"] for c in _chapters(a.doc_id, a.chapters)], a.profile,
+                                    a.model if a.model not in (None, "auto") else None, a.parallel)
         print(f"queued {len(ids)} jobs; running worker until idle")
         jobs.run_until_idle()
     elif a.cmd == "status":

@@ -34,6 +34,8 @@ ROUTING_KEY = "routing.v1"
 
 # model chosen for the current processing run (set by the job runner); applies to the token-heavy groups
 processing_model: contextvars.ContextVar[str | None] = contextvars.ContextVar("processing_model", default=None)
+# the current processing run may use several job threads / concurrent calls (premium models only)
+processing_parallel: contextvars.ContextVar[bool] = contextvars.ContextVar("processing_parallel", default=False)
 
 
 @dataclass(frozen=True)
@@ -52,7 +54,7 @@ GROUPS: tuple[Group, ...] = (
     Group("optimize", "Rewriting sections (3 levels)", ("optimize",), heavy=True,
           help="Long prompts for every section window."),
     Group("digest", "Section summaries", ("digest",), heavy=True),
-    Group("faithfulness", "Faithfulness checks", ("faithfulness",), heavy=True,
+    Group("faithfulness", "Faithfulness checks", ("faithfulness", "reconcile"), heavy=True,
           help="One reasoning call per ~10 rewritten passages."),
     Group("ask", "Ask AI about a selection", ("ask",), heavy=False),
     Group("hint", "Exercise hints", ("hint",), heavy=False),

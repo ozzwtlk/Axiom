@@ -24,6 +24,8 @@ export function DocumentPage() {
     { id: "local", label: "Local model", kind: "local", available: true },
     { id: "claude-code:haiku", label: "Claude Code · Haiku", kind: "subscription", available: true },
   ];
+  const [parallel, setParallel] = useState<boolean>(() => load<boolean>("axiom.processParallel", false));
+  const premiumRun = procModel !== "auto" && procModel !== "local";
   const [submitting, setSubmitting] = useState(false);
   const [kick, setKick] = useState(0); // forces polling right after submitting
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
@@ -79,6 +81,7 @@ export function DocumentPage() {
         chapters: [...selected].sort((a, b) => a - b),
         profile,
         ...(procModel !== "auto" ? { model: procModel } : {}),
+        ...(premiumRun && parallel ? { parallel: true } : {}),
       });
       setSelected(new Set());
       setKick(3); // keep polling for a few ticks even if the job list is not populated yet
@@ -272,6 +275,23 @@ export function DocumentPage() {
                     <option value="balanced">Balanced</option>
                     <option value="max">Max quality</option>
                   </select>
+                </label>
+                <label className="field checkbox">
+                  <input
+                    type="checkbox"
+                    checked={premiumRun && parallel}
+                    disabled={!premiumRun}
+                    onChange={(e) => {
+                      setParallel(e.target.checked);
+                      save("axiom.processParallel", e.target.checked);
+                    }}
+                  />
+                  Process in parallel
+                  <span className="small muted">
+                    {premiumRun
+                      ? " — chapters and sections run concurrently; afterwards a notation check re-writes sections that contradict earlier chapters"
+                      : " — needs a premium model (Qwen has one GPU)"}
+                  </span>
                 </label>
                 <p className="small muted process-note">
                   {procModel.startsWith("claude-code")

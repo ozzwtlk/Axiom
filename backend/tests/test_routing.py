@@ -207,3 +207,76 @@ def test_claude_code_sends_images_inline_without_tools(monkeypatch):
     assert a[a.index("--tools") + 1] == "" and a[a.index("--input-format") + 1] == "stream-json"
     msg = json.loads(seen["stdin"])
     assert msg["message"]["content"][0]["type"] == "image" and res.text == "$$x$$"
+
+
+def test_parallel_run_chains_optimize_per_chapter(tmp_db):
+    import json
+    from axiom.orchestration import jobs
+    from axiom.storage import db
+    with db.connect() as c:
+        c.execute("INSERT INTO documents(id,title,filename,sha256,page_count,created_at) VALUES ('d','T','f','h',1,'x')")
+        for n in (1, 2):
+            c.execute("INSERT INTO chapters(id,doc_id,number,title,page_start,page_end) VALUES (?,?,?,?,1,2)", (f"c{n}", "d", n, "t"))
+            for o in (0, 1):
+                c.execute("INSERT INTO sections(id,doc_id,chapter_id,number,title,ord,page_start,page_end) VALUES (?,?,?,?,?,?,1,2)",
+                          (f"s{n}{o}", "d", f"c{n}", f"{n}.{o}", "t", o))
+
+    def first_ch2_deps(parallel):
+        with db.connect() as c:
+            c.execute("DELETE FROM jobs")
+        jobs.enqueue_document("d", [1, 2], model="claude-code:sonnet", parallel=parallel)
+        r = db.q1("SELECT depends_on, parallel FROM jobs WHERE kind='optimize' AND target_id='s20'")
+        return json.loads(r["depends_on"]), r["parallel"]
+
+    deps, par = first_ch2_deps(False)
+    assert any(d.startswith("~") for d in deps) and par == 0   # one chain across the book
+    deps, par = first_ch2_deps(True)
+    assert not any(d.startswith("~") for d in deps) and par == 1  # chapters independent
+
+
+def test_parallel_run_ends_with_reconcile_job(tmp_db):
+    from axiom.orchestration import jobs
+    from axiom.storage import db
+    with db.connect() as c:
+        c.execute("INSERT INTO documents(id,title,filename,sha256,page_count,created_at) VALUES ('d','T','f','h',1,'x')")
+        c.execute("INSERT INTO chapters(id,doc_id,number,title,page_start,page_end) VALUES ('c1','d',1,'t',1,2)")
+        c.execute("INSERT INTO sections(id,doc_id,chapter_id,number,title,ord,page_start,page_end)"
+                  " VALUES ('s1','d','c1','1.1','t',0,1,2)")
+    jobs.enqueue_document("d", [1], model="claude-code:sonnet", parallel=True)
+    r = db.q1("SELECT target_id, parallel FROM jobs WHERE kind='reconcile'")
+    assert r["target_id"] == "d@1" and r["parallel"] == 0
+    with db.connect() as c:
+        c.execute("DELETE FROM jobs")
+    jobs.enqueue_document("d", [1], model="claude-code:sonnet", parallel=False)
+    assert not db.q1("SELECT 1 FROM jobs WHERE kind='reconcile'")
+
+
+def test_notation_groups_only_cross_chapter_symbols(tmp_db):
+    from axiom.storage import db
+    from axiom.verification import notation
+    with db.connect() as c:
+        c.execute("INSERT INTO documents(id,title,filename,sha256,page_count,created_at) VALUES ('d','T','f','h',1,'x')")
+        for n in (1, 2):
+            c.execute("INSERT INTO chapters(id,doc_id,number,title,page_start,page_end) VALUES (?,?,?,?,1,2)", (f"c{n}", "d", n, "t"))
+            c.execute("INSERT INTO sections(id,doc_id,chapter_id,number,title,ord,page_start,page_end)"
+                      " VALUES (?,?,?,?,?,0,1,2)", (f"s{n}", "d", f"c{n}", f"{n}.1", "t"))
+        for sid, sym in (("s1", "$g_{\\mu\\nu}$"), ("s2", "g_{\\mu\\nu}"), ("s1", "$x$"), ("s2", "$y$")):
+            c.execute("INSERT INTO notation(doc_id,section_id,symbol,meaning) VALUES ('d',?,?,'m')", (sid, sym))
+    g = notation._gather("d", {2})
+    assert [x["symbol"] for x in g] == ["g_{\\mu\\nu}"]  # normalised; x and y are single-chapter
+
+
+def test_reset_jobs_keeps_done_and_resets_sections(tmp_db):
+    from axiom.orchestration import jobs
+    from axiom.storage import db
+    with db.connect() as c:
+        c.execute("INSERT INTO documents(id,title,filename,sha256,page_count,created_at) VALUES ('d','T','f','h',1,'x')")
+        c.execute("INSERT INTO chapters(id,doc_id,number,title,page_start,page_end) VALUES ('c1','d',1,'t',1,2)")
+        c.execute("INSERT INTO sections(id,doc_id,chapter_id,number,title,ord,page_start,page_end,status)"
+                  " VALUES ('s1','d','c1','1.1','t',0,1,2,'failed')")
+        for i, st in enumerate(("pending", "running", "failed", "done")):
+            c.execute("INSERT INTO jobs(id,doc_id,kind,target_id,status,created_at,updated_at)"
+                      " VALUES (?,?,?,?,?,'x','x')", (f"j{i}", "d", "optimize", f"s{i}", st))
+    assert jobs.reset("d") == {"jobs_removed": 3, "sections_reset": 1}
+    assert [r["id"] for r in db.q("SELECT id FROM jobs")] == ["j3"]
+    assert jobs.reset(None, include_done=True)["jobs_removed"] == 1
