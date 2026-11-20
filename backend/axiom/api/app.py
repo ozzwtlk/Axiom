@@ -264,6 +264,9 @@ def create_app(start_worker: bool = True) -> FastAPI:
         and puts their sections back to 'pending'. Finished work (blocks, units, caches) is kept, so queueing the
         chapters again skips what is done. `include_done` also forgets finished jobs. Stop the workers first."""
         from axiom.orchestration import jobs
+        if role() == "server":
+            from axiom.api.internal import _reap
+            _reap(15)  # a dead worker's open transaction would block the writes below
         return jobs.reset(doc_id, include_done)
 
     @app.post("/api/documents/{doc_id}/cancel")

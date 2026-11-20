@@ -144,10 +144,13 @@ def call(task: str, model: "str | models.Route", req: ChatRequest, prompt_versio
         try:
             return call(task, model.model, req, prompt_version, doc_id=doc_id, profile=profile, use_cache=use_cache)
         except (AdapterUnavailable, BudgetExceeded) as e:
-            if not model.fallback:
+            fb = model.fallback
+            # never fall back to a model this machine cannot reach (a laptop has no Qwen): its "connection
+            # refused" would replace the real error of the model that was actually chosen
+            if not fb or not models.available("local" if models.kind(fb) == "local" else fb):
                 raise
             log.warning("%s: %s unavailable (%s); falling back to %s", task, model.model, e, model.fallback)
-            return call(task, model.fallback, req, prompt_version, doc_id=doc_id, profile=profile, use_cache=use_cache)
+            return call(task, fb, req, prompt_version, doc_id=doc_id, profile=profile, use_cache=use_cache)
     mid = _canon(model)
     mclass = _metering_class(mid, model)
     ad = get_adapter(mid)
@@ -270,7 +273,9 @@ def call_json(task: str, model: "str | models.Route", req: ChatRequest, prompt_v
             res, cached = call(task, mid, r, prompt_version, doc_id=doc_id, profile=profile)
         except (BudgetExceeded, AdapterUnavailable) as e:
             errors.append(f"{type(e).__name__}: {e}")
-            if route.fallback and not fell_back and _canon(mid) != _canon(route.fallback):
+            fb_ok = bool(route.fallback) and models.available("local" if models.kind(route.fallback) == "local"
+                                                               else route.fallback)  # see call(): no unreachable fallback
+            if fb_ok and not fell_back and _canon(mid) != _canon(route.fallback):
                 log.warning("%s: %s unavailable (%s); falling back to %s", task, mid, e, route.fallback)
                 fell_back = True
                 chain = chain[:i] + [route.fallback] * attempts

@@ -303,3 +303,51 @@ def test_chapter_with_empty_section_is_reextracted(tmp_db):
     ex = db.q1("SELECT id FROM jobs WHERE kind='reextract'")["id"]
     for r in db.q("SELECT depends_on FROM jobs WHERE kind='transcribe'"):
         assert ex in r["depends_on"]
+
+
+def test_no_fallback_to_unreachable_local_model(tmp_db, monkeypatch):
+    import pytest
+    from axiom.model_adapters.base import ChatRequest
+    from axiom.orchestration import llm, models
+    calls = []
+
+    def fake_inner(task, model, *a, **k):
+        calls.append(model)
+        raise llm.AdapterUnavailable(f"{model}: real error")
+    monkeypatch.setattr(models, "available", lambda mid: mid != "local")
+    route = models.Route("claude-code:sonnet", "local_vlm", "t")
+    # first call (the Route) delegates to call(model_id) which we make fail
+    orig = llm.call
+
+    def patched(task, model, *a, **k):
+        if isinstance(model, str):
+            return fake_inner(task, model)
+        return orig(task, model, *a, **k)
+    monkeypatch.setattr(llm, "call", patched)
+    with pytest.raises(llm.AdapterUnavailable, match="real error"):
+        llm.call("x", route, ChatRequest("s", "u"), "v")
+    assert calls == ["claude-code:sonnet"]  # local_vlm was never tried
+
+
+def test_transcribe_pool_keeps_processing_model(tmp_db, monkeypatch):
+    from axiom.orchestration import models
+    from axiom.storage import db
+    from axiom.transformations import transcribe
+    with db.connect() as c:
+        c.execute("INSERT INTO documents(id,title,filename,sha256,page_count,created_at) VALUES ('d','T','f','h',1,'x')")
+        c.execute("INSERT INTO chapters(id,doc_id,number,title,page_start,page_end) VALUES ('c1','d',1,'t',1,2)")
+        c.execute("INSERT INTO sections(id,doc_id,chapter_id,number,title,ord,page_start,page_end)"
+                  " VALUES ('s1','d','c1','1.1','t',0,1,2)")
+        for i in range(3):
+            c.execute("INSERT INTO blocks(id,doc_id,section_id,ord,page,x0,y0,x1,y1,block_type,raw_text,content_hash)"
+                      " VALUES (?,?,?,?,1,0,0,1,1,'paragraph','x','h')", (f"b{i}", "d", "s1", i))
+    seen = []
+    monkeypatch.setattr(transcribe, "_transcribe_one",
+                        lambda b, d, s, p: (seen.append((models.processing_model.get(), models.processing_parallel.get())), ("text_layer", False))[1])
+    tok = models.processing_model.set("claude-code:haiku")
+    tok2 = models.processing_parallel.set(True)
+    try:
+        transcribe.transcribe_section("s1")
+    finally:
+        models.processing_parallel.reset(tok2); models.processing_model.reset(tok)
+    assert seen == [("claude-code:haiku", True)] * 3

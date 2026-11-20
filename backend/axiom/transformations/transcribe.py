@@ -167,7 +167,11 @@ def transcribe_section(section_id: str, profile: str = "economy", should_stop=la
     from axiom.orchestration import models
     par = models.processing_parallel.get() and models.processing_model.get() not in (None, "auto", "local")
     with ThreadPoolExecutor(max_workers=max(1, settings.parallel_concurrency if par else settings.local_concurrency)) as ex:
-        for method, cached in ex.map(work, todo):
+        # pool threads do not inherit contextvars: without this the run's chosen model (models.processing_model)
+        # is lost and every call falls back to the Settings default (the local model)
+        import contextvars
+        ctx = contextvars.copy_context()
+        for method, cached in ex.map(lambda b: ctx.copy().run(work, b), todo):
             stats["vision" if method == "vision_ocr" else "text_layer"] += 1
             stats["cached"] += int(cached)
     with db.connect() as c:

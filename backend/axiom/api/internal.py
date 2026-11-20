@@ -90,13 +90,15 @@ class _Tx:
 
 _txs: dict[str, _Tx] = {}
 _txs_lock = threading.Lock()
-TX_IDLE_S = 120
+TX_IDLE_S = 60
 
 
-def _reap() -> None:
+def _reap(idle: float = TX_IDLE_S) -> None:
+    """Roll back worker transactions nobody has touched for `idle` s. A transaction held by a worker that died
+    keeps SQLite's write lock, which blocks *every* write on the server until it is rolled back."""
     now = time.monotonic()
     with _txs_lock:
-        dead = [k for k, t in _txs.items() if now - t.used > TX_IDLE_S]
+        dead = [k for k, t in _txs.items() if now - t.used > idle]
         for k in dead:
             t = _txs.pop(k)
             try:
@@ -201,7 +203,19 @@ def _safe_rel(rel: str) -> Path:
 
 
 # ---------------------------------------------------------------- wiring
+def _reaper() -> None:
+    while True:
+        time.sleep(10)
+        try:
+            _reap()
+        except Exception:  # never let the reaper die
+            log.exception("transaction reaper failed")
+
+
 def install(app: FastAPI) -> None:
+    if role() == "server" and not getattr(install, "_reaper_started", False):
+        install._reaper_started = True
+        threading.Thread(target=_reaper, daemon=True, name="tx-reaper").start()
     r = APIRouter(prefix="/internal", dependencies=[Depends(check_token)])
 
     @r.post("/db/run")
