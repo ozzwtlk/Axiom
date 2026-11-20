@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+from collections.abc import Mapping
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -108,6 +110,10 @@ CREATE TABLE IF NOT EXISTS visualizations (
   unit_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workers (
+  name TEXT PRIMARY KEY, info TEXT, models TEXT, last_seen TEXT, online INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
   block_id UNINDEXED, section_id UNINDEXED, doc_id UNINDEXED, text, tokenize='porter unicode61'
 );
@@ -129,6 +135,7 @@ def init(path: Path) -> None:
 
 _COLUMNS = {  # columns added after schema v1 (CREATE TABLE IF NOT EXISTS does not add them to old databases)
     "sections": [("digest_md", "TEXT")],
+    "jobs": [("model", "TEXT"), ("worker", "TEXT")],
 }
 
 
@@ -140,7 +147,128 @@ def _migrate(c: sqlite3.Connection) -> None:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
 
 
+# ---------------------------------------------------------------- remote mode (worker → server)
+# On a worker machine the database lives on the server. The same q()/q1()/connect() API then runs each statement
+# on the server's SQLite over authenticated HTTP (see api/internal.py); a `with connect()` block is a real
+# server-side transaction (BEGIN IMMEDIATE), so job claiming stays atomic across machines.
+_remote = None
+
+
+class RemoteRow(Mapping):
+    """Behaves like sqlite3.Row: r["col"], r[0], keys(), dict(r)."""
+    __slots__ = ("_cols", "_vals")
+
+    def __init__(self, cols: list[str], vals: list[Any]):
+        self._cols, self._vals = cols, vals
+
+    def __getitem__(self, k):
+        if isinstance(k, int):
+            return self._vals[k]
+        try:
+            return self._vals[self._cols.index(k)]
+        except ValueError:
+            raise KeyError(k) from None
+
+    def __iter__(self):
+        return iter(self._cols)
+
+    def __len__(self):
+        return len(self._cols)
+
+    def keys(self):
+        return list(self._cols)
+
+
+def _enc(v: Any) -> Any:
+    return {"$b64": base64.b64encode(v).decode()} if isinstance(v, (bytes, bytearray, memoryview)) else v
+
+
+def _dec(v: Any) -> Any:
+    return base64.b64decode(v["$b64"]) if isinstance(v, dict) and "$b64" in v else v
+
+
+class RemoteCursor:
+    def __init__(self, d: dict):
+        cols = d.get("cols") or []
+        self._rows = [RemoteRow(cols, [_dec(x) for x in r]) for r in d.get("rows") or []]
+        self.rowcount = d.get("rowcount", -1)
+        self.lastrowid = d.get("lastrowid")
+
+    def fetchone(self):
+        return self._rows.pop(0) if self._rows else None
+
+    def fetchall(self):
+        rows, self._rows = self._rows, []
+        return rows
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class RemoteConn:
+    """Connection-like object for one server-side transaction (or autocommit when tx is None)."""
+
+    def __init__(self, client, tx: str | None):
+        self._client, self._tx = client, tx
+
+    def execute(self, sql: str, args: tuple | list = ()) -> RemoteCursor:
+        return RemoteCursor(self._client.run(self._tx, sql, [_enc(a) for a in args]))
+
+    def commit(self) -> None:  # autocommit object: every statement is already committed
+        pass
+
+
+class RemoteDB:
+    def __init__(self, base_url: str, token: str, client=None):
+        import httpx
+        self.base = base_url.rstrip("/")
+        self._http = client or httpx.Client(timeout=120, headers={"Authorization": f"Bearer {token}"})
+        self._tl = threading.local()
+
+    def _post(self, path: str, body: dict) -> dict:
+        r = self._http.post(self.base + path, json=body)
+        if r.status_code >= 400:
+            raise sqlite3.OperationalError(f"remote db {path}: {r.status_code} {r.text[:300]}")
+        return r.json()
+
+    def run(self, tx: str | None, sql: str, args: list) -> dict:
+        return self._post("/internal/db/run", {"tx": tx, "sql": sql, "params": args})
+
+    @contextmanager
+    def transaction(self) -> Iterator[RemoteConn]:
+        outer = getattr(self._tl, "tx", None)
+        if outer:  # nested `with connect()` joins the outer transaction, like a single sqlite connection would
+            yield RemoteConn(self, outer)
+            return
+        tx = self._post("/internal/db/begin", {})["tx"]
+        self._tl.tx = tx
+        try:
+            yield RemoteConn(self, tx)
+            self._post("/internal/db/end", {"tx": tx, "commit": True})
+        except BaseException:
+            try:
+                self._post("/internal/db/end", {"tx": tx, "commit": False})
+            finally:
+                pass
+            raise
+        finally:
+            self._tl.tx = None
+
+
+def init_remote(base_url: str, token: str, client=None) -> None:
+    """Worker mode: every database call goes to the server; the schema is the server's business."""
+    global _remote
+    _remote = RemoteDB(base_url, token, client)
+
+
+def is_remote() -> bool:
+    return _remote is not None
+
+
 def conn() -> sqlite3.Connection:
+    if _remote is not None:
+        tx = getattr(_remote._tl, "tx", None)
+        return RemoteConn(_remote, tx)  # type: ignore[return-value]
     if _db_path is None:
         raise RuntimeError("storage.db.init() was not called")
     c = getattr(_local, "conn", None)
@@ -156,6 +284,10 @@ def conn() -> sqlite3.Connection:
 
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
+    if _remote is not None:
+        with _remote.transaction() as rc:
+            yield rc  # type: ignore[misc]
+        return
     c = conn()
     try:
         yield c
@@ -166,7 +298,7 @@ def connect() -> Iterator[sqlite3.Connection]:
 
 
 def q(sql: str, args: tuple | list = ()) -> list[sqlite3.Row]:
-    return conn().execute(sql, args).fetchall()
+    return conn().execute(sql, args).fetchall()  # remote mode: RemoteRow objects with the same interface
 
 
 def q1(sql: str, args: tuple | list = ()) -> sqlite3.Row | None:

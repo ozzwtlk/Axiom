@@ -32,18 +32,21 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _add(c, doc_id: str, kind: str, target: str, deps: list[str], profile: str) -> str:
+def _add(c, doc_id: str, kind: str, target: str, deps: list[str], profile: str, model: str | None = None) -> str:
     existing = c.execute("SELECT id, status FROM jobs WHERE kind=? AND target_id=? AND status IN ('pending','running','done')",
                          (kind, target)).fetchone()
     if existing:
         return existing["id"]
     jid = uuid.uuid4().hex[:12]
-    c.execute("INSERT INTO jobs(id,doc_id,kind,target_id,status,depends_on,profile,created_at,updated_at)"
-              " VALUES (?,?,?,?,?,?,?,?,?)", (jid, doc_id, kind, target, "pending", json.dumps(deps), profile, _now(), _now()))
+    c.execute("INSERT INTO jobs(id,doc_id,kind,target_id,status,depends_on,profile,model,created_at,updated_at)"
+              " VALUES (?,?,?,?,?,?,?,?,?,?)",
+              (jid, doc_id, kind, target, "pending", json.dumps(deps), profile, model, _now(), _now()))
     return jid
 
 
-def enqueue_document(doc_id: str, chapter_numbers: list[int], profile: str = "economy") -> list[str]:
+def enqueue_document(doc_id: str, chapter_numbers: list[int], profile: str = "economy",
+                     model: str | None = None) -> list[str]:
+    """`model`: one model for all bulk stages of this run (e.g. "claude-code:haiku"); None = routing settings."""
     ids: list[str] = []
     # optimize jobs form ONE chain across chapters: a section's context (summaries, notation) comes from all earlier
     # sections of the book, so it must not depend on how far a parallel chapter has got (stable cache keys)
@@ -53,12 +56,12 @@ def enqueue_document(doc_id: str, chapter_numbers: list[int], profile: str = "ec
             ch = c.execute("SELECT * FROM chapters WHERE doc_id=? AND number=?", (doc_id, n)).fetchone()
             if not ch:
                 continue
-            ex = _add(c, doc_id, "extract", ch["id"], [], profile)
+            ex = _add(c, doc_id, "extract", ch["id"], [], profile, model)
             ids.append(ex)
             for s in c.execute("SELECT * FROM sections WHERE chapter_id=? ORDER BY ord", (ch["id"],)).fetchall():
-                tr = _add(c, doc_id, "transcribe", s["id"], [ex], profile)
-                op = _add(c, doc_id, "optimize", s["id"], [tr] + ([prev_opt] if prev_opt else []), profile)
-                vf = _add(c, doc_id, "verify", s["id"], [op], profile)
+                tr = _add(c, doc_id, "transcribe", s["id"], [ex], profile, model)
+                op = _add(c, doc_id, "optimize", s["id"], [tr] + (["~" + prev_opt] if prev_opt else []), profile, model)
+                vf = _add(c, doc_id, "verify", s["id"], [op], profile, model)
                 ids += [tr, op, vf]
                 prev_opt = op
                 c.execute("UPDATE sections SET status='pending' WHERE id=? AND status NOT IN ('done','partial')", (s["id"],))
@@ -78,13 +81,42 @@ def cancel_document(doc_id: str) -> int:
     return len(rows)
 
 
+# name of this machine when it runs as a worker for a server (None: all-in-one, this process owns the queue)
+WORKER_NAME: str | None = None
+
+
+def enqueue_import(rel: str) -> str:
+    """A PDF uploaded to the server's inbox, imported by the next computing machine."""
+    with db.connect() as c:
+        return _add(c, "inbox", "import", rel, [], "economy")
+
+
 def recover() -> int:
     with db.connect() as c:
-        # an interruption is not a failure: give the attempt back
-        n = c.execute("UPDATE jobs SET status='pending', attempts=MAX(0, attempts-1), updated_at=? WHERE status='running'",
-                      (_now(),)).rowcount
-        c.execute("UPDATE sections SET status='pending' WHERE status='running'")
+        # an interruption is not a failure: give the attempt back. A worker only reclaims its own jobs.
+        own = " AND worker=?" if WORKER_NAME else ""
+        args = (_now(), WORKER_NAME) if WORKER_NAME else (_now(),)
+        n = c.execute("UPDATE jobs SET status='pending', attempts=MAX(0, attempts-1), updated_at=? WHERE status='running'"
+                      + own, args).rowcount
+        if not WORKER_NAME:
+            c.execute("UPDATE sections SET status='pending' WHERE status='running'")
     return n
+
+
+_GROUP_OF_KIND = {"transcribe": "transcribe", "optimize": "optimize", "verify": "faithfulness"}
+
+
+def can_run(job, selected: str = "auto") -> bool:
+    """May this machine take the job? Only the chosen computing machine (or anyone under "auto"), and only if it
+    has the model the job needs — so a Qwen run waits for the PC instead of failing on a laptop."""
+    if WORKER_NAME and selected not in ("auto", WORKER_NAME):
+        return False
+    group = _GROUP_OF_KIND.get(job["kind"])
+    if not group:
+        return True  # import / extract need no model
+    from axiom.orchestration import models
+    need = job["model"] if "model" in job.keys() and job["model"] else models.resolve(group).model
+    return models.available("local" if need in ("local_text", "local_vlm") else need)
 
 
 _claim_lock = threading.Lock()
@@ -94,17 +126,26 @@ def _claim(kinds: tuple[str, ...]) -> dict | None:
     with _claim_lock, db.connect() as c:
         done = {r["id"] for r in c.execute("SELECT id FROM jobs WHERE status='done'")}
         failed = {r["id"] for r in c.execute("SELECT id FROM jobs WHERE status IN ('failed','cancelled')")}
+        # "~<id>" = ordering-only dependency: wait until that job has finished, but do not inherit its failure
+        # (the optimize chain: a failed earlier section must not fail every later section and chapter)
+        sel_row = c.execute("SELECT value FROM meta WHERE key='compute.selected'").fetchone()
+        selected = (sel_row["value"] if sel_row else None) or "auto"
         for j in c.execute(f"SELECT * FROM jobs WHERE status='pending' AND kind IN ({','.join('?' * len(kinds))})"
                            " ORDER BY created_at, rowid", kinds).fetchall():
-            deps = json.loads(j["depends_on"])
+            all_deps = json.loads(j["depends_on"])
+            deps = [d for d in all_deps if not d.startswith("~")]
+            soft = [d[1:] for d in all_deps if d.startswith("~")]
+            if not all(d in done or d in failed for d in soft):
+                continue
             if any(d in failed for d in deps):
                 c.execute("UPDATE jobs SET status='failed', error='upstream dependency failed', updated_at=? WHERE id=?",
                           (_now(), j["id"]))
                 c.execute("UPDATE sections SET status='failed' WHERE id=? AND status NOT IN ('done','partial')",
                           (j["target_id"],))
                 continue
-            if all(d in done for d in deps):
-                c.execute("UPDATE jobs SET status='running', attempts=attempts+1, updated_at=? WHERE id=?", (_now(), j["id"]))
+            if all(d in done for d in deps) and can_run(j, selected):
+                c.execute("UPDATE jobs SET status='running', attempts=attempts+1, worker=?, updated_at=? WHERE id=?",
+                          (WORKER_NAME, _now(), j["id"]))
                 return dict(j)
     return None
 
@@ -118,7 +159,21 @@ def _run(job: dict) -> None:
         return _stop.is_set() or job["id"] in _cancel_requested
 
     kind, target, profile = job["kind"], job["target_id"], job["profile"]
-    if kind == "extract":
+    from axiom.orchestration import models
+    token = models.processing_model.set(job.get("model"))  # the model chosen for this processing run
+    try:
+        _run_kind(job, kind, target, profile, should_stop)
+    finally:
+        models.processing_model.reset(token)
+
+
+def _run_kind(job: dict, kind: str, target: str, profile: str, should_stop) -> None:
+    from axiom.extraction.extract import extract_chapter
+    from axiom.orchestration.pipeline import optimize_and_verify
+    from axiom.transformations.transcribe import transcribe_section
+    if kind == "import":
+        result = _import_from_inbox(target)
+    elif kind == "extract":
         result = {"blocks": extract_chapter(job["doc_id"], target)}
     elif kind == "transcribe":
         with db.connect() as c:
@@ -171,7 +226,7 @@ def start_workers(n_transcribe: int = 1, n_optimize: int | None = None, idle_exi
     recover()
     _stop.clear()
     threads = []
-    for kinds, n in ((("extract", "transcribe"), n_transcribe), (("optimize", "verify", "extract"), n_optimize)):
+    for kinds, n in ((("import", "extract", "transcribe"), n_transcribe), (("optimize", "verify", "extract"), n_optimize)):
         for _ in range(n):
             t = threading.Thread(target=_worker, args=(kinds, idle_exit), daemon=True)
             t.start()
@@ -186,3 +241,19 @@ def stop_workers() -> None:
 def run_until_idle() -> None:
     for t in start_workers(idle_exit=True):
         t.join()
+
+
+def _import_from_inbox(rel: str) -> dict:
+    from axiom.ingestion.pdf import import_pdf
+    from axiom.storage import files
+    from pathlib import Path
+    local = files.fetch(rel)
+    name = rel.split("__", 1)[-1]
+    staged = local.with_name(name)  # import under the original file name (it becomes the default title)
+    local.replace(staged)
+    try:
+        doc_id = import_pdf(staged, Path(name).stem)
+    finally:
+        staged.unlink(missing_ok=True)
+    files.remove(rel)
+    return {"doc_id": doc_id}

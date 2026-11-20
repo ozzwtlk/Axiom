@@ -32,6 +32,7 @@ cd frontend && pnpm dev   # :5173, proxies /api → :8000
 10. `sections.summary_md` (window summaries) is optimizer context and must not be replaced; readers get `digest_md`.
 11. Subscription CLIs (`claude`, `codex`) run only through `model_adapters/cli_agents.py`: no tools, empty temp cwd, no user MCP/settings/hooks, no API keys in env, document text via stdin. Never add a tool or a writable dir.
 12. "Auto" may route to cloud models only when `cloud_enabled` is on; bulk groups stay local by default. All model choice goes through `models.resolve()`.
+14. Role "server" never computes: any endpoint that runs a model, parses a PDF or renders must call `require_compute()` first (api/internal.py). Workers reach data only through `db`/`files` (remote mode) — never open `settings.db_path` directly in pipeline code.
 13. llama.cpp gets our LaTeX-tolerant GBNF (`model_adapters/gbnf.py`), never its built-in json_schema mode (it forced `\lambda` → `\frac{\tilde…}`).
 
 ## Gotchas

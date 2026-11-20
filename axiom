@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # AXIOM launcher: one command to run everything.
 #
-#   ./axiom            start whatever is not running yet (local model + app), open the browser
+#   ./axiom            start AXIOM (worker mode if set up, else everything on this PC), open the browser
 #   ./axiom stop       stop what this launcher started
 #   ./axiom status     show what is running
-#   ./axiom logs       follow the app and model logs
+#   ./axiom logs       follow the logs
 #   ./axiom install-desktop   add "AXIOM" to your application menu
+#
+# With a server (e.g. a Raspberry Pi running docker compose):
+#   ./axiom new-token                     print a random shared secret for the server's .env
+#   ./axiom setup-worker <server-url> [name]   make this PC/laptop a computing machine (asks for the token)
+#   ./axiom worker                        connect to the server (+ start the local model if there is one)
+#   ./axiom migrate-to-server <user@host:/path/to/server-data>   copy your existing books to the server
 #
 # Services keep running in the background after this script exits; `./axiom stop` ends them.
 # Already-running services (started by hand or by a previous launch) are reused, never restarted.
@@ -17,6 +23,7 @@ LLM_PORT="${AXIOM_LLM_PORT:-8081}"
 APP_URL="http://127.0.0.1:${APP_PORT}"
 RUN="$ROOT/data/run"
 LOGS="$ROOT/data/logs"
+WORKER_ENV="$ROOT/.axiom-worker.env"
 mkdir -p "$RUN" "$LOGS"
 
 say()  { printf '\033[1m%s\033[0m %s\n' "▸" "$*"; }
@@ -102,6 +109,7 @@ stop_one() {  # only stops processes this launcher started (pid file), and their
 }
 
 cmd_stop() {
+  stop_one worker
   stop_one app
   stop_one llm
   if app_up || llm_up; then
@@ -113,6 +121,11 @@ cmd_stop() {
 }
 
 cmd_status() {
+  if [[ -f "$WORKER_ENV" ]]; then
+    load_worker_env
+    if worker_up; then say "worker:      connected to ${AXIOM_SERVER_URL} as ${AXIOM_WORKER_NAME:-$(hostname)}"
+    else say "worker:      not connected (server: ${AXIOM_SERVER_URL})"; fi
+  fi
   if llm_up; then say "local model: running on :${LLM_PORT}"; else say "local model: stopped"; fi
   if app_up; then
     say "AXIOM:       running at ${APP_URL}"
@@ -120,6 +133,88 @@ cmd_status() {
   else
     say "AXIOM:       stopped"
   fi
+}
+
+
+# ---------------------------------------------------------------- server / worker mode
+load_worker_env() {
+  [[ -f "$WORKER_ENV" ]] || die "not set up as a computing machine yet: ./axiom setup-worker <server-url> [name]"
+  set -a; # shellcheck disable=SC1090
+  source "$WORKER_ENV"; set +a
+  [[ -n "${AXIOM_SERVER_URL:-}" && -n "${AXIOM_TOKEN:-}" ]] || die "$WORKER_ENV needs AXIOM_SERVER_URL and AXIOM_TOKEN"
+}
+
+cmd_new_token() { python3 -c "import secrets; print(secrets.token_hex(24))"; }
+
+cmd_setup_worker() {
+  local url=${1:-} name=${2:-$(hostname)} token
+  [[ -n "$url" ]] || die "usage: ./axiom setup-worker <server-url, e.g. http://192.168.1.20:8080> [machine name]"
+  url=${url%/}
+  up "$url/api/health" || die "cannot reach $url (is the server running? is the address right?)"
+  read -r -s -p "AXIOM_TOKEN from the server's .env: " token; echo
+  [[ ${#token} -ge 16 ]] || die "the token must be at least 16 characters"
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$url/internal/db/run" -H "Authorization: Bearer $token" \
+         -H 'content-type: application/json' -d '{"sql":"SELECT 1","params":[]}')
+  [[ "$code" == 200 ]] || die "the server rejected the token (HTTP $code)"
+  umask 077
+  printf 'AXIOM_SERVER_URL=%s\nAXIOM_TOKEN=%s\nAXIOM_WORKER_NAME=%s\n# AXIOM_WORKER_LOCAL_MODEL=off   # never start the local model on this machine\n' \
+    "$url" "$token" "$name" > "$WORKER_ENV"
+  say "this machine is now “$name”, computing for $url  (config: .axiom-worker.env)"
+  say "start it with: ./axiom worker"
+}
+
+worker_up() {
+  curl -fsS -m 3 "${AXIOM_SERVER_URL}/api/workers" 2>/dev/null \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if any(w['name']=='${AXIOM_WORKER_NAME:-$(hostname)}' and w['online'] for w in d['workers']) else 1)"
+}
+
+cmd_worker() {
+  local open_browser=1
+  [[ "${1:-}" == "--no-browser" ]] && open_browser=0
+  load_worker_env
+  command -v uv >/dev/null || die "uv is not installed (https://docs.astral.sh/uv/)"
+  up "${AXIOM_SERVER_URL}/api/health" || die "cannot reach the server at ${AXIOM_SERVER_URL}"
+  [[ -d "$ROOT/backend/tools/node_modules" ]] || (cd "$ROOT/backend/tools" && pnpm install --silent)
+
+  # local model only where it exists (your PC); a laptop uses its Claude Code / Codex logins
+  if [[ "${AXIOM_WORKER_LOCAL_MODEL:-auto}" != off ]] && ! llm_up && [[ -x "$ROOT/scripts/start-local-llm.sh" ]] \
+     && "$ROOT/scripts/start-local-llm.sh" --check >/dev/null 2>&1; then
+    say "Starting the local model…"
+    start_bg llm "$LOGS/llm.log" "$ROOT/scripts/start-local-llm.sh"
+    wait_for llm_up 300 "the local model" "$LOGS/llm.log" || warn "continuing without the local model"
+  fi
+
+  if worker_up; then
+    say "this machine is already connected to ${AXIOM_SERVER_URL}"
+  else
+    say "Connecting to ${AXIOM_SERVER_URL} as “${AXIOM_WORKER_NAME:-$(hostname)}”…"
+    (cd "$ROOT/backend" && AXIOM_DATA_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/axiom-worker" \
+       start_bg worker "$LOGS/worker.log" uv run axiom worker)
+    wait_for worker_up 90 "the connection to the server" "$LOGS/worker.log" || die "could not connect (log: data/logs/worker.log)"
+  fi
+  say "Ready: ${AXIOM_SERVER_URL}   (stop with: ./axiom stop)"
+  if (( open_browser )) && command -v xdg-open >/dev/null; then xdg-open "${AXIOM_SERVER_URL}" >/dev/null 2>&1 || true; fi
+}
+
+cmd_migrate() {
+  local target=${1:-}
+  [[ -n "$target" ]] || die "usage: ./axiom migrate-to-server <user@host:/path/to/server-data>  (stop the server container first)"
+  command -v rsync >/dev/null || die "rsync is not installed"
+  [[ -f "$ROOT/data/axiom.db" ]] || die "no local data in $ROOT/data"
+  local snap="$RUN/axiom-snapshot.db"
+  say "Taking a consistent snapshot of the database…"
+  python3 - "$ROOT/data/axiom.db" "$snap" <<'PY'
+import sqlite3, sys
+src, dst = sqlite3.connect(sys.argv[1]), sqlite3.connect(sys.argv[2])
+src.backup(dst); dst.close()
+PY
+  say "Copying books and database to $target …"
+  rsync -a --info=progress2 "$ROOT/data/docs" "$ROOT/data/exports" "$target/" 2>/dev/null || rsync -a "$ROOT/data/docs" "$target/"
+  rsync -a "$snap" "$target/axiom.db"
+  rm -f "$snap"
+  say "done. On the server: make sure the data dir is owned by uid 1000 (sudo chown -R 1000:1000 <dir>), then"
+  say "      docker compose up -d   — and on this PC: ./axiom setup-worker http://<server>:<port>"
 }
 
 cmd_install_desktop() {
@@ -137,14 +232,21 @@ EOF
   say "added $f — AXIOM is now in your application menu"
 }
 
+default_start() { if [[ -f "$WORKER_ENV" ]]; then cmd_worker "$@"; else cmd_start "$@"; fi; }
+
 case "${1:-start}" in
-  start)           shift || true; cmd_start "$@" ;;
-  --no-browser)    cmd_start --no-browser ;;
+  start)           shift || true; default_start "$@" ;;
+  --no-browser)    default_start --no-browser ;;
+  local)           shift; cmd_start "$@" ;;
+  worker)          shift; cmd_worker "$@" ;;
+  setup-worker)    shift; cmd_setup_worker "$@" ;;
+  new-token)       cmd_new_token ;;
+  migrate-to-server) shift; cmd_migrate "$@" ;;
   stop)            cmd_stop ;;
-  restart)         cmd_stop; sleep 2; cmd_start ;;
+  restart)         cmd_stop; sleep 2; default_start ;;
   status)          cmd_status ;;
-  logs)            tail -n 30 -F "$LOGS/app.log" "$LOGS/llm.log" ;;
+  logs)            tail -n 30 -F "$LOGS"/*.log ;;
   install-desktop) cmd_install_desktop ;;
-  -h|--help|help)  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help)  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
   *)               die "unknown command '$1' (try ./axiom help)" ;;
 esac

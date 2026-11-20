@@ -196,6 +196,8 @@ export type Profile = "economy" | "balanced" | "max";
 export interface ProcessRequest {
   chapters: number[];
   profile: Profile;
+  /** one model for the whole run ("local", "claude-code:haiku", ...); omitted = Settings */
+  model?: string;
 }
 
 export interface ProcessResponse {
@@ -305,9 +307,39 @@ export interface GroupInfo {
 export interface ModelsReport {
   models: ModelInfo[];
   groups: GroupInfo[];
+  /** machine whose models these are */
+  machine?: string | null;
 }
 export interface Routing {
   groups: Record<TaskGroup, string>;
   premium_default: string;
   cloud_enabled: boolean;
+}
+
+// ---------------------------------------------------------------- computing machines (server mode)
+export interface MachineModel {
+  id: string;
+  label: string;
+  kind: ModelKind;
+  available: boolean;
+}
+export interface Machine {
+  name: string;
+  online: boolean;
+  last_seen: string;
+  info: { hostname?: string; platform?: string };
+  models: MachineModel[];
+}
+export interface MachinesReport {
+  /** "server": data on a server, computing on connected machines; "all": everything on this computer */
+  mode: "server" | "all" | "worker";
+  selected: string;
+  effective: string | null;
+  workers: Machine[];
+}
+export interface PendingImport {
+  id: string;
+  filename: string;
+  status: string;
+  error: string | null;
 }

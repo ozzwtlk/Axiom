@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { BrowserRouter, Link, Route, Routes, useLocation } from "react-router-dom";
 import { MOCK } from "./api/client";
 import { Icon } from "./components/Icon";
+import { MachinePicker } from "./components/MachinePicker";
 import { DocumentPage } from "./pages/DocumentPage";
 import { ExercisePage } from "./pages/ExercisePage";
 import { Library } from "./pages/Library";
@@ -44,6 +45,7 @@ function TopBar() {
       </nav>
       {MOCK && <span className="tag" title="Using built-in fixtures (?mock=0 to disable)">mock data</span>}
       <span className="spacer" />
+      <MachinePicker />
       <button type="button" className="icon-btn" onClick={toggleTheme} title="Toggle theme (D)" aria-label="Toggle theme">
         <Icon name={effectiveTheme === "dark" ? "sun" : "moon"} />
       </button>

@@ -8,6 +8,11 @@ PORT="${AXIOM_LLM_PORT:-8081}"
 CTX="${AXIOM_LLM_CTX:-32768}"
 PAR="${AXIOM_LLM_PARALLEL:-2}"
 MMPROJ="${AXIOM_MMPROJ:-$HOME/.local/share/llm/models/mmproj-Qwen3.6-35B-A3B-F16.gguf}"
+# --check: is a local model installed on this machine? (used by `./axiom worker`; a laptop without one skips it)
+if [[ "${1:-}" == "--check" ]]; then
+  [[ -x "$LLAMA_DIR/llama-server" && -f "$MODEL" ]]
+  exit $?
+fi
 EXTRA=()
 [ -f "$MMPROJ" ] && EXTRA+=(--mmproj "$MMPROJ")
 exec "$LLAMA_DIR/llama-server" -m "$MODEL" --host 127.0.0.1 --port "$PORT" \

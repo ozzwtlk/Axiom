@@ -1,6 +1,6 @@
 import type {
   AnswerCheck, AskRequest, AskResponse, DocumentDetail, ExerciseMapItem, Quiz, QuizResult, Solution, Visualization, DocumentSummary, Exercise, HintResponse,
-  ProcessRequest, ProcessResponse, ProgressReport, SearchHit, SectionView, SourceBlock, ModelsReport, Routing, TaskGroup,
+  ProcessRequest, ProcessResponse, ProgressReport, SearchHit, SectionView, SourceBlock, ModelsReport, Routing, TaskGroup, MachinesReport, PendingImport,
 } from "./types";
 import * as M from "../mocks/sampleSection";
 
@@ -56,7 +56,8 @@ export function listDocuments(): Promise<DocumentSummary[]> {
   return request("/documents");
 }
 
-export function uploadDocument(file: File): Promise<DocumentSummary> {
+/** Returns the document, or {queued: true} when a server stores it for the next computing machine to import. */
+export function uploadDocument(file: File): Promise<DocumentSummary | { queued: true; filename: string }> {
   if (MOCK) return delay({ ...M.mockDocuments[0], title: file.name }, 400);
   const fd = new FormData();
   fd.append("file", file);
@@ -173,6 +174,26 @@ export function makeVisualization(unitId: string, regenerate = false, model?: st
   if (regenerate) q.set("regenerate", "true");
   if (model && model !== "auto") q.set("model", model);
   return request(`/units/${enc(unitId)}/visualization${q.size ? "?" + q : ""}`, json({}));
+}
+
+// ---------------------------------------------------------------- computing machines
+export function getMachines(): Promise<MachinesReport> {
+  if (MOCK) return delay({ mode: "all", selected: "local", effective: "local", workers: [] } as MachinesReport);
+  return request("/workers");
+}
+
+export function selectMachine(name: string): Promise<MachinesReport> {
+  return request("/workers/selected", { method: "PUT", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name }) });
+}
+
+export function forgetMachine(name: string): Promise<MachinesReport> {
+  return request(`/workers/${enc(name)}`, { method: "DELETE" });
+}
+
+export function listImports(): Promise<PendingImport[]> {
+  if (MOCK) return delay([]);
+  return request("/imports");
 }
 
 // ---------------------------------------------------------------- models & routing

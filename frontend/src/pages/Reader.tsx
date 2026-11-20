@@ -12,6 +12,7 @@ import { ShortcutsHelp } from "../components/ShortcutsHelp";
 import { isOpenable, StatusBadge } from "../components/StatusBadge";
 import { UnitView } from "../components/UnitView";
 import { Icon } from "../components/Icon";
+import { MachinePicker } from "../components/MachinePicker";
 import { isTypingTarget, usePrefs, type Width } from "../lib/prefs";
 
 const WIDTHS: { w: Width; label: string }[] = [
@@ -476,6 +477,7 @@ export function Reader() {
           ))}
         </div>
         <div className="header-right">
+          <MachinePicker compact />
           {docId && <SearchBox docId={docId} compact />}
           <button type="button" className="tool-btn" onClick={jumpExercises} title="Jump to exercises (E)">
             <Icon name="pencil" />
@@ -794,6 +796,10 @@ function DisplayMenu() {
             </span>
             <input type="checkbox" checked={exerciseFirst} onChange={(e) => setExerciseFirst(e.target.checked)} />
           </label>
+          <div className="menu-machine">
+            <h4>Computing machine</h4>
+            <MachinePicker />
+          </div>
           <hr className="divider" />
           <Link to="/settings" className="small">
             AI model settings →

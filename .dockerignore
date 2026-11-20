@@ -1,0 +1,14 @@
+.git
+data
+server-data
+**/node_modules
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+frontend/dist
+graphify-out
+*.pdf
+.env
+.axiom-worker.env
+backend/benchmarks/results

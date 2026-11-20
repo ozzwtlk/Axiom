@@ -17,6 +17,7 @@ The model can only return text; that text is then parsed and validated like any 
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -60,10 +61,11 @@ def _strip_for_openai(schema):
 
 
 class ClaudeCodeAdapter:
-    """`claude -p` with a model alias (sonnet, opus, haiku, fable) or a full model name."""
+    """`claude -p` with a model alias (sonnet, opus, haiku, fable) or a full model name. Images (scan crops) are
+    sent inline in a stream-json user message, so no file access or tool is needed."""
 
     model_class = "premium"
-    supports_vision = False
+    supports_vision = True
     kind = "subscription"
 
     def __init__(self, model: str = "sonnet", binary: str = "claude", timeout: float = 900):
@@ -88,21 +90,31 @@ class ClaudeCodeAdapter:
             return {"installed": True, "logged_in": False, "detail": "could not read login status"}
 
     def chat(self, req: ChatRequest) -> ChatResult:
-        if req.images:
-            raise AdapterUnavailable(f"{self.name} cannot read images here; transcription stays on the local model")
-        args = [self.binary, "-p", "--output-format", "json", "--tools", "", "--strict-mcp-config",
+        stream = bool(req.images)
+        args = [self.binary, "-p", "--output-format", "stream-json" if stream else "json", "--tools", "", "--strict-mcp-config",
                 "--setting-sources", "", "--disable-slash-commands", "--no-session-persistence",
                 "--model", self.model, "--effort", "high" if req.thinking else "low",
                 "--system-prompt", req.system or "You are a careful physics tutor."]
         if req.json_schema is not None:
             args += ["--json-schema", json.dumps(req.json_schema)]
+        stdin = req.user_text
+        if stream:
+            args += ["--input-format", "stream-json", "--verbose"]
+            content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                    "data": base64.b64encode(i.png).decode()}} for i in req.images]
+            content.append({"type": "text", "text": req.user_text})
+            stdin = json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n"
         t0 = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="axiom-claude-") as cwd:
-            r = _run(args, req.user_text, cwd, self.timeout)
+            r = _run(args, stdin, cwd, self.timeout)
         try:
-            d = json.loads(r.stdout)
-        except json.JSONDecodeError as e:
-            raise AdapterUnavailable(f"{self.name}: unexpected output ({(r.stderr or r.stdout)[:300]})") from e
+            if stream:  # one JSON event per line; the last "result" event carries the answer
+                d = next(json.loads(line) for line in reversed(r.stdout.splitlines())
+                         if line.startswith("{") and '"type":"result"' in line.replace(" ", ""))
+            else:
+                d = json.loads(r.stdout)
+        except (json.JSONDecodeError, StopIteration) as e:
+            raise AdapterUnavailable(f"{self.name}: unexpected output ({(r.stderr or r.stdout)[-300:]})") from e
         if d.get("is_error") or d.get("subtype") != "success":
             raise AdapterUnavailable(f"{self.name}: {str(d.get('result') or d.get('subtype'))[:300]}")
         text = json.dumps(d["structured_output"]) if d.get("structured_output") is not None else d.get("result", "")

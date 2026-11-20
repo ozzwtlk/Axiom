@@ -167,9 +167,9 @@ def call(task: str, model: "str | models.Route", req: ChatRequest, prompt_versio
         limit = prof.max_premium_calls or 40  # an explicit API choice under "economy" still gets a small budget
         if doc_id and premium_calls_used(doc_id) >= limit:
             raise BudgetExceeded(f"API call budget ({limit}) exhausted for {doc_id}")
-    elif k == "subscription" and models.calls_today(mid) >= models.daily_limit():
-        raise BudgetExceeded(f"daily limit for {mid} reached ({models.daily_limit()} calls); "
-                             "raise AXIOM_SUBSCRIPTION_DAILY_LIMIT or wait until tomorrow")
+    elif k == "subscription" and models.calls_today(mid) >= models.daily_limit(task):
+        raise BudgetExceeded(f"daily limit for {mid} reached ({models.daily_limit(task)} calls); "
+                             "raise AXIOM_SUBSCRIPTION_DAILY_LIMIT(_BULK) or wait until tomorrow")
     with _sem(mid):
         try:
             res = ad.chat(req)

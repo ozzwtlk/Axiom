@@ -12,7 +12,7 @@ from pathlib import Path
 import pymupdf
 
 from axiom.config import settings
-from axiom.storage import db
+from axiom.storage import db, files
 
 CHAPTER_RE = re.compile(r"^\s*(?:CHAPTER|Chapter)\s+(\d+)\s*[:.\-–]?\s*(.*)$")
 SECTION_RE = re.compile(r"^\s*(\d+)\s*\.\s*(\d+)\s*[•·.:\-–]?\s*(.*)$")
@@ -112,6 +112,7 @@ def import_pdf(src: Path, title: str | None = None) -> str:
     if not dst.exists():
         shutil.copy2(src, dst)
         dst.chmod(0o444)
+    files.publish(f"docs/{doc_id}/original.pdf")  # worker: the server keeps the original
     pdf = pymupdf.open(dst)
     meta_title = (pdf.metadata or {}).get("title") or ""
     doc_title = title or meta_title or src.stem
@@ -140,4 +141,4 @@ def import_pdf(src: Path, title: str | None = None) -> str:
 
 
 def open_pdf(doc_id: str) -> pymupdf.Document:
-    return pymupdf.open(settings.doc_dir(doc_id) / "original.pdf")
+    return pymupdf.open(files.fetch(f"docs/{doc_id}/original.pdf"))

@@ -18,6 +18,11 @@ optional and off by default.
 The launcher builds the UI when its sources changed, reuses anything already running, and keeps logs in
 `data/logs/`. Without the local model you can still read processed books; processing needs it.
 
+**Server + computing machines:** keep the books on an always-on box such as a Raspberry Pi (Docker), read them
+from your phone or laptop, and let your PC or laptop do the computing when it is on. See
+[docs/DEPLOY.md](docs/DEPLOY.md):
+`docker compose up -d` on the Pi, then `./axiom setup-worker http://<pi>:8080` and `./axiom` on each PC.
+
 Then add a PDF in the library, tick the chapters to process on the book page, and start reading as soon as the
 first sections are ready.
 

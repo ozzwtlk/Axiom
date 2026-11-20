@@ -116,3 +116,21 @@ All JSON. Base `/api`.
 | GET | `/units/{unit_id}/visualization.html` | the sandboxed page (CSP `sandbox allow-scripts`, no network) |
 
 TypeScript shapes: see `frontend/src/api/types.ts` (mirrors `backend/axiom/api/schemas.py`).
+
+
+## Deployment roles (docs/DEPLOY.md)
+
+`AXIOM_ROLE` = `all` (default: everything in one process on one PC) | `server` | `worker`.
+
+* **server** (`axiom serve --role server`, Docker image `docker/Dockerfile`): owns `data/` (SQLite, PDFs, image
+  cache), serves the reader and every read endpoint, never computes. Endpoints that compute call
+  `require_compute()`; on the server that returns a marker response and the middleware in `api/internal.py`
+  forwards the original request over the chosen worker's WebSocket. GET `…/image` results are stored server-side.
+  Uploads go to `data/inbox/` + an `import` job.
+* **worker** (`axiom worker`): `db.init_remote()` makes `db.q/q1/connect()` run on the server
+  (`/internal/db/run|begin|end`, server-held `BEGIN IMMEDIATE` transactions, rows returned as `RemoteRow`);
+  `files.fetch/publish` move PDFs. It executes forwarded requests against its own in-process app
+  (`httpx.ASGITransport`) and runs the job loop. `jobs.can_run()`: only the selected machine (or anyone under
+  auto) claims jobs, and only jobs whose model it has; `jobs.worker` records the claimant so a disconnect requeues
+  exactly its jobs.
+* Selection: `meta['compute.selected']` = `auto` | machine name; auto prefers a machine reporting a local model.

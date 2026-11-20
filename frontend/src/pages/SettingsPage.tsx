@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { getRouting, saveRouting } from "../api/client";
+import { forgetMachine, getRouting, saveRouting } from "../api/client";
+import { useMachines } from "../lib/machines";
 import type { ModelInfo, Routing, TaskGroup } from "../api/types";
 import { modelLabel, refreshModels, useModelsReport } from "../lib/models";
 
@@ -41,9 +42,11 @@ export function SettingsPage() {
       </div>
       {err && <p className="error">{err}</p>}
 
+      <MachinesCard />
+
       <section className="settings-grid">
         <div className="card side-card">
-          <h3>Available models</h3>
+          <h3>Available models{report?.machine ? ` on ${report.machine}` : ""}</h3>
           <ul className="model-list">
             {models.map((m) => (
               <ModelRow key={m.id} m={m} />
@@ -159,5 +162,51 @@ function ModelRow({ m }: { m: ModelInfo }) {
       </span>
       <span className={`tag ${m.available ? "tag-done" : ""}`}>{m.available ? "ready" : "unavailable"}</span>
     </li>
+  );
+}
+
+function MachinesCard() {
+  const [r, choose] = useMachines();
+  const [err, setErr] = useState<string | null>(null);
+  if (!r || r.mode !== "server") return null;
+  return (
+    <section className="card side-card machines-card">
+      <h3>Computing machines</h3>
+      <p className="small muted">
+        Your books live on the server; AI answers and processing run on a connected PC or laptop
+        (<code>./axiom worker</code>). “Auto” prefers a machine with a local model. Jobs that need a model a machine
+        doesn't have wait for one that does.
+      </p>
+      {err && <p className="error small">{err}</p>}
+      <ul className="model-list">
+        <li className="model-row">
+          <input type="radio" name="machine" checked={r.selected === "auto"} onChange={() => choose("auto")} />
+          <span className="model-row-main">
+            <strong>Auto</strong>
+            <span className="small muted">{r.effective ? `now: ${r.effective}` : "no machine connected"}</span>
+          </span>
+        </li>
+        {r.workers.map((w) => (
+          <li key={w.name} className="model-row">
+            <input type="radio" name="machine" checked={r.selected === w.name} onChange={() => choose(w.name)} />
+            <span className={`status-dot ${w.online ? "on" : "off"}`} aria-hidden="true" />
+            <span className="model-row-main">
+              <strong>{w.name}</strong>
+              <span className="small muted">
+                {w.online ? "online" : `offline · last seen ${new Date(w.last_seen).toLocaleString()}`}
+                {" · "}
+                {w.models.filter((m) => m.available).map((m) => m.label).join(", ") || "no models"}
+              </span>
+            </span>
+            {!w.online && (
+              <button type="button" className="link-btn small"
+                onClick={() => forgetMachine(w.name).then(() => choose(r.selected === w.name ? "auto" : r.selected)).catch((e) => setErr(e.message))}>
+                forget
+              </button>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }

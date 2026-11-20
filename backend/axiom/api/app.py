@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import uuid
+import os
 import logging
 import re
 import tempfile
@@ -10,7 +12,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
+
+from axiom.api.internal import install as install_internal, require_compute, role
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -26,6 +30,7 @@ log = logging.getLogger("axiom.api")
 class ProcessRequest(BaseModel):
     chapters: list[int]
     profile: str = "economy"
+    model: str | None = None  # one model for transcription, rewriting and checks of this run; None = Settings
 
 
 class AnkiPushRequest(BaseModel):
@@ -135,7 +140,13 @@ def progress_report(doc_id: str) -> ProgressReport:
 
 
 def create_app(start_worker: bool = True) -> FastAPI:
-    db.init(settings.db_path)
+    if role() == "server":
+        start_worker = False  # the server never computes; workers connect to it
+    if not db.is_remote():
+        db.init(settings.db_path)
+    if role() == "server":
+        from axiom.orchestration import jobs
+        jobs.recover()  # every running job belonged to a worker that is not connected yet
 
     @asynccontextmanager
     async def lifespan(app):
@@ -148,24 +159,15 @@ def create_app(start_worker: bool = True) -> FastAPI:
             jobs.stop_workers()
 
     app = FastAPI(title="AXIOM", lifespan=lifespan)
+    install_internal(app)  # worker endpoints + compute forwarding (active only in the "server" role)
 
     @app.get("/api/models")
     def list_models():
-        """Every model AXIOM can use, whether it is usable right now, and today's subscription usage."""
-        from axiom.model_adapters.cli_agents import ClaudeCodeAdapter, CodexAdapter
+        """Models of the machine that computes (this one, or the connected worker when running as a server)."""
+        require_compute()
         from axiom.orchestration import models
-        status = {"claude-code": ClaudeCodeAdapter().login_status(), "codex": CodexAdapter().login_status()}
-        out = []
-        for m in models.catalog():
-            vendor = m["id"].split(":", 1)[0]
-            st = status.get(vendor, {})
-            usable = models.available(m["id"]) and st.get("logged_in", True)
-            out.append(dict(m, available=usable, detail=st.get("detail") or ("" if usable else "not reachable"),
-                            calls_today=models.calls_today(m["id"]) if m["kind"] == "subscription" else None,
-                            daily_limit=models.daily_limit() if m["kind"] == "subscription" else None))
-        return {"models": out, "groups": [{"id": g.id, "label": g.label, "heavy": g.heavy, "vision": g.vision,
-                                           "help": g.help, "auto": models.resolve(g.id).model}
-                                          for g in models.GROUPS]}
+        import socket
+        return dict(models.report(), machine=os.environ.get("AXIOM_WORKER_NAME") or socket.gethostname())
 
     @app.get("/api/settings/routing")
     def get_routing():
@@ -182,9 +184,21 @@ def create_app(start_worker: bool = True) -> FastAPI:
 
     @app.get("/api/health")
     def health():
+        if role() == "server":  # the server computes nothing: report storage and connected machines
+            from axiom.api.internal import registry
+            eff = registry.effective()
+            return {"role": "server", "machines_online": sorted(registry.workers), "computing_machine": eff.name if eff else None}
         from axiom.orchestration.llm import get_adapter, premium_available
         local = get_adapter("local_text")
-        return {"local_llm": getattr(local, "health", lambda: None)(), "premium_configured": premium_available()}
+        return {"role": role(), "local_llm": getattr(local, "health", lambda: None)(), "premium_configured": premium_available()}
+
+    @app.get("/api/imports")
+    def list_imports():
+        """PDFs uploaded to the server that a computing machine has not imported yet."""
+        rows = db.q("SELECT id, target_id, status, error, updated_at FROM jobs WHERE kind='import' AND status!='done' "
+                    "ORDER BY created_at")
+        return [{"id": r["id"], "filename": r["target_id"].split("__", 1)[-1], "status": r["status"],
+                 "error": (r["error"] or "").splitlines()[0][:200] if r["error"] else None} for r in rows]
 
     @app.get("/api/documents", response_model=list[DocumentSummary])
     def list_documents():
@@ -195,6 +209,15 @@ def create_app(start_worker: bool = True) -> FastAPI:
         from axiom.ingestion.pdf import import_pdf
         if not (file.filename or "").lower().endswith(".pdf"):
             raise HTTPException(400, "only PDF files are supported")
+        if role() == "server":  # store now; a computing machine imports it as soon as one is connected
+            from axiom.orchestration import jobs
+            safe = re.sub(r"[^A-Za-z0-9._ -]+", "_", Path(file.filename).name)[:120]
+            rel = f"inbox/{uuid.uuid4().hex[:12]}__{safe}"
+            dest = settings.data_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(await file.read())
+            jobs.enqueue_import(rel)
+            return JSONResponse({"queued": True, "filename": safe}, status_code=202)
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / Path(file.filename).name
             p.write_bytes(await file.read())
@@ -223,9 +246,13 @@ def create_app(start_worker: bool = True) -> FastAPI:
     @app.post("/api/documents/{doc_id}/process")
     def process(doc_id: str, body: ProcessRequest):
         from axiom.orchestration import jobs
+        from axiom.orchestration import models
         if body.profile not in ("economy", "balanced", "max"):
             raise HTTPException(400, "unknown profile")
-        return {"job_ids": jobs.enqueue_document(doc_id, body.chapters, body.profile)}
+        model = None if body.model in (None, "", "auto") else body.model
+        if model and role() != "server" and model not in {m["id"] for m in models.catalog() if m["vision"]}:
+            raise HTTPException(400, f"{model} cannot process scans (needs a model that reads images)")
+        return {"job_ids": jobs.enqueue_document(doc_id, body.chapters, body.profile, model)}
 
     @app.post("/api/documents/{doc_id}/cancel")
     def cancel(doc_id: str):
@@ -283,6 +310,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
             raise HTTPException(404, "block not found")
         p = block_crop_path(b["doc_id"], block_id)
         if not p.exists():
+            require_compute()
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(crop_png(b["doc_id"], b["page"], (b["x0"], b["y0"], b["x1"], b["y1"])))
         return FileResponse(p, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
@@ -295,12 +323,14 @@ def create_app(start_worker: bool = True) -> FastAPI:
             raise HTTPException(404, "page not found")
         p = settings.doc_dir(doc_id) / "pages" / f"{page:04d}.png"
         if not p.exists():
+            require_compute()
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(open_pdf(doc_id)[page - 1].get_pixmap(dpi=130).tobytes("png"))
         return FileResponse(p, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
     @app.post("/api/ask", response_model=AskResponse)
     def ask(req: AskRequest):
+        require_compute()
         from axiom.model_adapters.base import AdapterUnavailable
         from axiom.orchestration.llm import BudgetExceeded
         from axiom.retrieval.context import ask as do_ask
@@ -324,6 +354,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
 
     @app.post("/api/exercises/{exercise_id}/hint", response_model=HintResponse)
     def get_hint(exercise_id: str, body: HintRequest):
+        require_compute()
         from axiom.exercises.engine import hint
         try:
             text, model, cached = hint(exercise_id, body.level, model=body.model)
@@ -363,6 +394,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
 
     @app.get("/api/documents/{doc_id}/anki")
     def anki_export(doc_id: str, deck: str = "AXIOM", chapters: str | None = None, format: str = "tsv"):
+        require_compute()
         from axiom.anki.export import build_cards, export_path, to_apkg, to_tsv
         chs = [int(x) for x in chapters.split(",")] if chapters else None
         cards = build_cards(doc_id, chs)
@@ -377,6 +409,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
 
     @app.post("/api/documents/{doc_id}/anki/push")
     def anki_push(doc_id: str, body: AnkiPushRequest):
+        require_compute()
         from axiom.anki.export import build_cards, push_ankiconnect
         try:
             return push_ankiconnect(build_cards(doc_id, body.chapters), body.deck)
@@ -396,6 +429,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
 
     @app.post("/api/exercises/{exercise_id}/solution")
     def make_solution(exercise_id: str, body: ModelChoice | None = None):
+        require_compute()
         from axiom.exercises.solutions import get_solution as gs
         try:
             return gs(exercise_id, model=body.model if body else None)
@@ -406,6 +440,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
 
     @app.post("/api/exercises/{exercise_id}/check")
     def check(exercise_id: str, body: CheckRequest):
+        require_compute()
         from axiom.exercises.solutions import check_answer
         try:
             return check_answer(exercise_id, body.answer_md, model=body.model)
@@ -429,6 +464,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
     # ------------------------------------------------------------ mastery checks
     @app.post("/api/quizzes")
     def make_quiz(body: QuizRequest):
+        require_compute()
         from axiom.exercises.mastery import generate_quiz, public_quiz
         try:
             return public_quiz(generate_quiz(body.scope, body.scope_id, body.n, variant=body.variant, model=body.model))
@@ -441,6 +477,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
 
     @app.post("/api/quizzes/{quiz_id}/grade")
     def grade_quiz(quiz_id: str, body: GradeRequest):
+        require_compute()
         from axiom.exercises.mastery import grade
         try:
             return grade(quiz_id, body.answers, model=body.model)
@@ -466,6 +503,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
 
     @app.post("/api/units/{unit_id}/visualization")
     def make_viz(unit_id: str, regenerate: bool = False, model: str | None = None):
+        require_compute()
         from axiom.orchestration.llm import ValidationFailed
         from axiom.visualization.generate import visualize
         try:

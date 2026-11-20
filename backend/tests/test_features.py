@@ -297,7 +297,7 @@ def test_optimize_chain_spans_chapters_and_notation_context_ignores_row_ids(tmp_
     jobs.enqueue_document("d", [2, 1])
     first_ch2 = db.q1("SELECT depends_on FROM jobs WHERE kind='optimize' AND target_id='d-s2.1'")["depends_on"]
     last_ch1 = db.q1("SELECT id FROM jobs WHERE kind='optimize' AND target_id='d-s1.2'")["id"]
-    assert last_ch1 in json.loads(first_ch2)  # chapter 2 waits for chapter 1's context
+    assert "~" + last_ch1 in json.loads(first_ch2)  # chapter 2 waits for chapter 1 (ordering only)
 
     def put(order):
         with db.connect() as c:

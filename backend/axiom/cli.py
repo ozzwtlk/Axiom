@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import logging
 import sys
 from pathlib import Path
@@ -41,10 +42,24 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("status"); p.add_argument("doc_id")
     p = sub.add_parser("serve"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8000)
     p.add_argument("--no-worker", action="store_true")
+    p.add_argument("--role", choices=["all", "server"], default=None,
+                   help="server: store data and serve the reader only; computing machines connect to it")
+    p = sub.add_parser("worker", help="compute for an AXIOM server (runs jobs and AI requests on this machine)")
+    p.add_argument("--server", default=os.environ.get("AXIOM_SERVER_URL"), help="e.g. http://192.168.1.20:8080")
+    p.add_argument("--name", default=None, help="machine name shown in the reader (default: hostname)")
+    p.add_argument("--no-jobs", action="store_true", help="answer AI requests only, do not process books")
     p = sub.add_parser("anki"); p.add_argument("doc_id"); p.add_argument("--format", default="apkg", choices=["apkg", "tsv", "push"])
     p.add_argument("--deck", default="AXIOM"); p.add_argument("--chapters"); p.add_argument("--out")
     p = sub.add_parser("refit-crops"); p.add_argument("doc_id")
     a = ap.parse_args(argv)
+    if a.cmd == "worker":  # token only from the environment (not visible in the process list)
+        if not a.server:
+            raise SystemExit("set --server or AXIOM_SERVER_URL")
+        from axiom.orchestration.remote_worker import run
+        run(a.server, os.environ.get("AXIOM_TOKEN", ""), a.name, run_jobs=not a.no_jobs)
+        return 0
+    if a.cmd == "serve" and a.role:
+        os.environ["AXIOM_ROLE"] = a.role
     db.init(settings.db_path)
 
     if a.cmd == "import":

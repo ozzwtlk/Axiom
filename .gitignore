@@ -9,3 +9,5 @@ frontend/dist/
 .ruff_cache/
 .pytest_cache/
 graphify-out/
+server-data/
+.axiom-worker.env

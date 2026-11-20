@@ -6,7 +6,8 @@ import { jobsRunning, ProgressPanel } from "../components/ProgressPanel";
 import { Icon } from "../components/Icon";
 import { SearchBox } from "../components/SearchBox";
 import { isOpenable, StatusBadge } from "../components/StatusBadge";
-import { loadPosition } from "../lib/storage";
+import { useModelsReport } from "../lib/models";
+import { load, loadPosition, save } from "../lib/storage";
 
 export function DocumentPage() {
   const { docId = "" } = useParams();
@@ -15,6 +16,14 @@ export function DocumentPage() {
   const [err, setErr] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [profile, setProfile] = useState<Profile>("balanced");
+  const [procModel, setProcModel] = useState<string>(() => load<string>("axiom.processModel", "local"));
+  const report = useModelsReport();
+  const known = (report?.models ?? []).filter((m) => m.vision && m.kind !== "api");
+  // no machine connected (server mode): still let the user queue a run for Qwen or Claude
+  const visionModels = known.length ? known : [
+    { id: "local", label: "Local model", kind: "local", available: true },
+    { id: "claude-code:haiku", label: "Claude Code · Haiku", kind: "subscription", available: true },
+  ];
   const [submitting, setSubmitting] = useState(false);
   const [kick, setKick] = useState(0); // forces polling right after submitting
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
@@ -66,7 +75,11 @@ export function DocumentPage() {
     if (!selected.size) return;
     setSubmitting(true);
     try {
-      await processDocument(docId, { chapters: [...selected].sort((a, b) => a - b), profile });
+      await processDocument(docId, {
+        chapters: [...selected].sort((a, b) => a - b),
+        profile,
+        ...(procModel !== "auto" ? { model: procModel } : {}),
+      });
       setSelected(new Set());
       setKick(3); // keep polling for a few ticks even if the job list is not populated yet
       await refresh();
@@ -235,6 +248,24 @@ export function DocumentPage() {
               </p>
               <div className="process-bar">
                 <label className="field">
+                  Model
+                  <select
+                    value={procModel}
+                    onChange={(e) => {
+                      setProcModel(e.target.value);
+                      save("axiom.processModel", e.target.value);
+                    }}
+                  >
+                    {visionModels.map((m) => (
+                      <option key={m.id} value={m.id} disabled={!m.available}>
+                        {m.kind === "local" ? "Qwen (local, free)" : `${m.label.replace("Claude Code · ", "Claude ")} (subscription)`}
+                        {m.available ? "" : " — not available"}
+                      </option>
+                    ))}
+                    <option value="auto">As in AI model settings</option>
+                  </select>
+                </label>
+                <label className="field">
                   Quality profile
                   <select value={profile} onChange={(e) => setProfile(e.target.value as Profile)}>
                     <option value="economy">Economy (local only)</option>
@@ -242,6 +273,13 @@ export function DocumentPage() {
                     <option value="max">Max quality</option>
                   </select>
                 </label>
+                <p className="small muted process-note">
+                  {procModel.startsWith("claude-code")
+                    ? `Fast (≈ 30–60 min per chapter), but uses ≈ 700–800 calls per chapter from your Claude plan. If the plan's limit is hit, the run continues on Qwen.`
+                    : procModel === "local"
+                      ? "Free and private; ≈ 3–5 hours of GPU time per chapter."
+                      : "Uses the per-task models from the AI models page."}
+                </p>
                 <button type="button" className="btn" disabled={!selected.size || submitting} onClick={onProcess}>
                   {submitting ? "Starting…" : `Process ${selected.size || ""} chapter${selected.size === 1 ? "" : "s"}`}
                 </button>

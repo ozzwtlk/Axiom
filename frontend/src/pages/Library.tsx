@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { listDocuments, uploadDocument } from "../api/client";
-import type { DocumentSummary } from "../api/types";
+import { listDocuments, listImports, uploadDocument } from "../api/client";
+import type { DocumentSummary, PendingImport } from "../api/types";
 import { Cover } from "./DocumentPage";
 
 export function Library() {
@@ -10,14 +10,20 @@ export function Library() {
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  const [imports, setImports] = useState<PendingImport[]>([]);
   const refresh = () =>
-    listDocuments()
-      .then((d) => (setDocs(d), setErr(null)))
+    Promise.all([listDocuments(), listImports().catch(() => [])])
+      .then(([d, im]) => (setDocs(d), setImports(im), setErr(null)))
       .catch((e) => setErr(`Could not load documents: ${e.message ?? e}`));
 
   useEffect(() => {
     refresh();
   }, []);
+  useEffect(() => {  // a computing machine imports queued uploads: watch for them to appear
+    if (!imports.length) return;
+    const t = window.setInterval(refresh, 5000);
+    return () => window.clearInterval(t);
+  }, [imports.length]);
 
   const onUpload = async (f: File | undefined) => {
     if (!f) return;
@@ -58,6 +64,17 @@ export function Library() {
                 <div style={{ width: `${d.chapters_total ? (100 * d.chapters_done) / d.chapters_total : 0}%` }} />
               </div>
             </Link>
+          ))}
+          {imports.map((im) => (
+            <div key={im.id} className="book-card pending-import">
+              <div className="book-cover">
+                <div className="book-cover-fallback">
+                  {im.status === "failed" ? "Import failed" : im.status === "running" ? "Importing…" : "Waiting for a computing machine…"}
+                </div>
+              </div>
+              <div className="book-title">{im.filename}</div>
+              <div className="book-meta">{im.error ?? "Stored on the server; imported as soon as a PC connects."}</div>
+            </div>
           ))}
           <label className={`add-card ${uploading ? "disabled" : ""}`}>
             <span className="plus" aria-hidden="true">+</span>

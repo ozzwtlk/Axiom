@@ -19,6 +19,7 @@ per-request choice is honoured as-is (no silent fallback: an error is shown inst
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import shutil
@@ -30,6 +31,9 @@ from datetime import datetime, timezone
 from axiom.storage import db
 
 ROUTING_KEY = "routing.v1"
+
+# model chosen for the current processing run (set by the job runner); applies to the token-heavy groups
+processing_model: contextvars.ContextVar[str | None] = contextvars.ContextVar("processing_model", default=None)
 
 
 @dataclass(frozen=True)
@@ -73,7 +77,10 @@ def _codex_models() -> list[str]:
     return [m.strip() for m in os.environ.get("AXIOM_CODEX_MODELS", "default").split(",") if m.strip()]
 
 
-def daily_limit() -> int:
+def daily_limit(task: str | None = None) -> int:
+    """Calls per subscription model per day. Bulk processing (one chapter ≈ 700–800 calls) has its own cap."""
+    if task and TASK_GROUP.get(task) and GROUP_BY_ID[TASK_GROUP[task]].heavy:
+        return int(os.environ.get("AXIOM_SUBSCRIPTION_DAILY_LIMIT_BULK", "4000"))
     return int(os.environ.get("AXIOM_SUBSCRIPTION_DAILY_LIMIT", "300"))
 
 
@@ -82,7 +89,7 @@ def catalog() -> list[dict]:
     out = [{"id": "local", "label": "Local model (Qwen, llama.cpp)", "kind": "local", "vision": True}]
     names = {"sonnet": "Sonnet", "opus": "Opus", "haiku": "Haiku", "fable": "Fable"}
     out += [{"id": f"claude-code:{m}", "label": f"Claude Code · {names.get(m, m)}", "kind": "subscription",
-             "vision": False} for m in _claude_models()]
+             "vision": True} for m in _claude_models()]
     out += [{"id": f"codex:{m}", "label": "Codex" + ("" if m == "default" else f" · {m}"), "kind": "subscription",
              "vision": False} for m in _codex_models()]
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -206,6 +213,11 @@ def _resolve(group: str, override: str | None, profile: str) -> Route:
     g = GROUP_BY_ID[group]
     if override and override != "auto":
         return Route(override, None, "chosen for this request")
+    run = processing_model.get()
+    if g.heavy and run and run != "auto":
+        vision_ok = not g.vision or next((m["vision"] for m in catalog() if m["id"] == run), False)
+        if vision_ok:  # a long run should finish: fall back to the local model if the subscription runs out
+            return Route(run, None if run == "local" else "local", "chosen for this processing run")
     choice = load_routing()["groups"].get(group, "auto")
     if choice != "auto":
         return Route(choice, None if choice == "local" else "local", "set in Settings")
@@ -219,3 +231,19 @@ def _resolve(group: str, override: str | None, profile: str) -> Route:
     if not cloud and not g.heavy:
         return Route("local", None, "auto: cloud models are off (Settings)")
     return Route("local", None, "auto: token-heavy task → local")
+
+
+def report() -> dict:
+    """This machine's models with availability (installed, signed in, server up) and today's usage, plus what
+    "auto" resolves to for every task group. Sent by workers to the server when they connect."""
+    from axiom.model_adapters.cli_agents import ClaudeCodeAdapter, CodexAdapter
+    status = {"claude-code": ClaudeCodeAdapter().login_status(), "codex": CodexAdapter().login_status()}
+    out = []
+    for m in catalog():
+        st = status.get(m["id"].split(":", 1)[0], {})
+        usable = available(m["id"]) and st.get("logged_in", True)
+        sub = m["kind"] == "subscription"
+        out.append(dict(m, available=usable, detail=st.get("detail") or ("" if usable else "not reachable"),
+                        calls_today=calls_today(m["id"]) if sub else None, daily_limit=daily_limit() if sub else None))
+    return {"models": out, "groups": [{"id": g.id, "label": g.label, "heavy": g.heavy, "vision": g.vision,
+                                       "help": g.help, "auto": resolve(g.id).model} for g in GROUPS]}

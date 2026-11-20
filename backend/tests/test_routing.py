@@ -158,3 +158,52 @@ def test_codex_runs_with_shell_and_browser_disabled(monkeypatch):
     assert "web_search=disabled" in a and "OPENAI_API_KEY" not in seen["env"]
     assert "minItems" not in json.dumps(seen["schema"])  # stripped for OpenAI structured outputs
     assert res.text == '{"ok": true}'
+
+
+def test_processing_model_applies_to_bulk_stages_with_local_fallback(tmp_db, install):
+    from axiom.orchestration import models
+    install("local", reply="x")
+    install("claude-code:haiku", reply="x")
+    tok = models.processing_model.set("claude-code:haiku")
+    try:
+        r = models.resolve("transcribe", local_as="local_vlm")
+        assert (r.model, r.fallback) == ("claude-code:haiku", "local_vlm")
+        assert models.resolve("optimize", local_as="local_text").model == "claude-code:haiku"
+        assert models.resolve("hint").model == "local"  # interactive groups are not affected (cloud off)
+    finally:
+        models.processing_model.reset(tok)
+    assert models.resolve("transcribe").model == "local"
+    assert models.daily_limit("transcribe") > models.daily_limit("hint")
+
+
+def test_soft_dependency_waits_but_does_not_inherit_failure(tmp_db, monkeypatch):
+    from axiom.orchestration import jobs
+    with db.connect() as c:
+        c.execute("INSERT INTO documents VALUES ('d','T','f','h',10,'now','{}')")
+        for jid, st, deps in (("a", "failed", "[]"), ("b", "pending", '["~a"]'), ("c", "pending", '["a"]'),
+                              ("w", "running", "[]"), ("d2", "pending", '["~w"]')):
+            c.execute("INSERT INTO jobs(id,doc_id,kind,target_id,status,depends_on,profile,created_at,updated_at)"
+                      " VALUES (?,?,?,?,?,?,?,?,?)", (jid, "d", "optimize", "t-" + jid, st, deps, "economy", jid, jid))
+    got = jobs._claim(("optimize",))
+    assert got["id"] == "b"  # ordering dep finished (failed) → runs
+    assert jobs._claim(("optimize",)) is None  # c fails (hard dep failed); d2 waits for w, still running
+    assert db.q1("SELECT status FROM jobs WHERE id='c'")["status"] == "failed"
+    assert db.q1("SELECT status FROM jobs WHERE id='d2'")["status"] == "pending"
+
+
+def test_claude_code_sends_images_inline_without_tools(monkeypatch):
+    from axiom.model_adapters import cli_agents
+    from axiom.model_adapters.base import ImagePart
+    seen = {}
+
+    def fake_run(args, input, capture_output, text, cwd, env, timeout, start_new_session):
+        seen.update(args=args, stdin=input)
+        lines = [json.dumps({"type": "system"}), json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                                              "result": "$$x$$", "usage": {}})]
+        return subprocess.CompletedProcess(args, 0, "\n".join(lines), "")
+    monkeypatch.setattr(cli_agents.subprocess, "run", fake_run)
+    res = cli_agents.ClaudeCodeAdapter("haiku").chat(ChatRequest("s", "transcribe", [ImagePart(b"\x89PNG")]))
+    a = seen["args"]
+    assert a[a.index("--tools") + 1] == "" and a[a.index("--input-format") + 1] == "stream-json"
+    msg = json.loads(seen["stdin"])
+    assert msg["message"]["content"][0]["type"] == "image" and res.text == "$$x$$"

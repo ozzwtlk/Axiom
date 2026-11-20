@@ -1,0 +1,18 @@
+# AXIOM server — run this on the Raspberry Pi (or any always-on box):
+#   cp .env.example .env   # set AXIOM_TOKEN (./axiom new-token prints one) and, if you like, AXIOM_PORT
+#   docker compose up -d --build
+# Then open http://<pi-address>:<AXIOM_PORT> on your phone or laptop, and run `./axiom worker` on your PC.
+services:
+  axiom:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: axiom-server:latest
+    container_name: axiom
+    restart: unless-stopped
+    ports:
+      - "${AXIOM_PORT:-8080}:8000"
+    environment:
+      AXIOM_TOKEN: ${AXIOM_TOKEN:?set AXIOM_TOKEN in .env (at least 16 characters)}
+    volumes:
+      - ${AXIOM_DATA:-./server-data}:/data

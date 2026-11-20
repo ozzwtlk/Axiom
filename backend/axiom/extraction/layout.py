@@ -208,7 +208,9 @@ def estimate_geometry(rows: list[Row], page_height: float) -> PageGeometry:
     # leftmost bucket with real support (exercise lists have hanging indents: item starts are
     # the minority but define the column edge)
     need = max(2, 0.10 * len(wide))
-    left = min(k for k, v in buckets.items() if v >= need) * 3.0
+    supported = [k for k, v in buckets.items() if v >= need]
+    # pages with few wide lines (chapter openers, figure pages) may have no supported bucket: keep the median
+    left = min(supported) * 3.0 if supported else left
     left = min((r.x0 for r in wide if abs(r.x0 - left) < 4), default=left)
     right = statistics.median([r.x1 for r in wide])
     body_size = statistics.median([r.median_size for r in wide])
