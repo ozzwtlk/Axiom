@@ -89,9 +89,16 @@ export function VizPanel({ unitId }: { unitId: string }) {
             referrerPolicy="no-referrer"
             loading="lazy"
           />
-          <button type="button" className="link-btn" onClick={() => generate(true)}>
-            regenerate
-          </button>
+          <div className="viz-actions small">
+            <a href={`${visualizationHtmlUrl(unitId)}?download=1`} download className="link-btn">
+              save as file
+            </a>
+            {" · "}
+            <button type="button" className="link-btn" onClick={() => generate(true)}>
+              regenerate
+            </button>
+            {viz.model && <span className="muted"> · made by {viz.model}{viz.automatic ? " during processing" : ""}</span>}
+          </div>
         </>
       )}
     </div>

@@ -310,3 +310,103 @@ def test_optimize_chain_spans_chapters_and_notation_context_ignores_row_ids(tmp_
     a = _context(sec, "d", None)
     put([rows[1], rows[0], rows[2]])  # s1.2 re-optimized first -> different row ids, same book
     assert _context(sec, "d", None) == a and "Minkowski metric" in a and "metric (old)" not in a
+
+
+# ---------------------------------------------------------------- teaching extras: notes, diagrams, xrefs
+def test_faithfulness_checks_equation_notes_and_drops_only_them(tmp_db, fake):
+    """Equation units carry AI explanations now (annotation, deep dive, study notes); a false one is dropped, the
+    verbatim equation is never touched."""
+    from axiom.verification.faithfulness import verify_section
+    eq = {"kind": "equation", "role": "key_equation", "min_level": 1, "title": None, "text_md": "",
+          "latex": "E = mc^2", "eq_number": "1.1", "annotation_md": "Energy of a body at rest.",
+          "deep_md": "Expanding $\\gamma m$ for small $v$ gives $$E \\approx m + \\tfrac12 m v^2.$$",
+          "notes": [{"kind": "pitfall", "md": "Here $c$ is not set to 1."}],
+          "block_ids": ["b0"], "coverage": "preserved", "ai_generated": False, "flags": [], "pages": [1]}
+    _section([("equation", "$$E = mc^2$$ (1.1)")], [eq])
+    seen = {}
+
+    def verdicts(req):
+        seen["user"] = req.user_text
+        return {"problems": [{"unit": "U1", "field": "notes", "verdict": "contradicted", "claim": "c is not set to 1",
+                              "explanation": "the book uses c = 1", "source_evidence": "c = 1"},
+                             {"unit": "U1", "field": "text", "verdict": "contradicted", "claim": "E = mc^2",
+                              "explanation": "bogus", "source_evidence": ""}]}
+    fake({"exacting physics editor": verdicts})
+    stats = verify_section("d-s1.1")
+    assert stats["units_checked"] == 1 and stats["flagged"] == 1
+    assert "equation (verbatim from the source): $$E = mc^2$$" in seen["user"] and "notes (pitfall)" in seen["user"]
+    u = json.loads(db.q1("SELECT data FROM units")["data"])
+    assert u["notes"] == [] and u["latex"] == "E = mc^2" and u["deep_md"] and u["annotation_md"]
+    assert u["verification"]["status"] == "flagged"
+
+
+def test_visualizations_follow_their_passage_when_a_section_is_reoptimized(tmp_db):
+    from axiom.transformations.optimize import _store
+    _section([("paragraph", "a"), ("paragraph", "b"), ("paragraph", "c")],
+             [_unit("A", ["b0"]), _unit("B", ["b1"]), _unit("C", ["b2"])])
+    with db.connect() as c:
+        for uid, blocks in (("d-s1.1-u001", ["b1"]), ("d-s1.1-u002", ["b2"])):
+            c.execute("INSERT INTO visualizations VALUES (?,?,?,?)",
+                      (uid, "d", json.dumps({"title": uid, "html": "<svg></svg>", "anchor_blocks": blocks}), "t"))
+    # re-optimized: a new unit in front shifts every id; the passage of b2 is gone (merged into a heading here)
+    _store("d-s1.1", "d", [_unit("New lead", ["b0"]), _unit("A", ["b0"]), _unit("B", ["b1"]),
+                           dict(_unit("", ["b2"]), kind="heading")], [], [], [])
+    viz = {r["unit_id"]: json.loads(r["data"])["title"] for r in db.q("SELECT unit_id, data FROM visualizations")}
+    assert viz.get("d-s1.1-u002") == "d-s1.1-u001"  # B moved from u001 to u002 together with its picture
+    detached = [k for k in viz if k.startswith("detached:d-s1.1:")]
+    assert len(detached) == 1 and viz[detached[0]] == "d-s1.1-u002"  # kept, not lost, and not on a wrong unit
+    assert "d-s1.1-u003" not in viz
+    # it comes back when its passage does
+    _store("d-s1.1", "d", [_unit("A", ["b0"]), _unit("B", ["b1"]), _unit("C", ["b2"])], [], [], [])
+    viz = {r["unit_id"]: json.loads(r["data"])["title"] for r in db.q("SELECT unit_id, data FROM visualizations")}
+    assert viz == {"d-s1.1-u001": "d-s1.1-u001", "d-s1.1-u002": "d-s1.1-u002"}
+
+
+def test_xrefs_link_equations_figures_sections_and_report_dangling(tmp_db):
+    from axiom.verification.xrefs import xrefs
+    _section([("figure", ""), ("caption", "FIGURE 1.5 A light cone."), ("paragraph", "p")],
+             [_unit("By (1.29) and Figure 1.5 (see Section 1.1); also (9.99).", ["b2"])])
+    with db.connect() as c:
+        c.execute("INSERT INTO blocks(id,doc_id,section_id,ord,page,x0,y0,x1,y1,block_type,raw_text,content_hash,"
+                  "transcribed_md,transcription_method,confidence,eq_number) VALUES ('beq','d','d-s1.1',9,2,0,0,1,1,"
+                  "'equation','','h','$$a=b$$ (1.29)','vision_ocr',0.9,'1.29')")
+    x = xrefs("d")
+    assert x["equations"]["1.29"] == {"block_id": "beq", "section_id": "d-s1.1", "page": 2, "latex": "a=b"}
+    assert x["figures"]["1.5"]["image_url"] == "/api/blocks/b0/image"
+    assert x["sections"]["1.1"]["section_id"] == "d-s1.1"
+    assert x["unresolved"] == [{"kind": "equation", "ref": "9.99", "section_id": "d-s1.1"}]
+
+
+def test_auto_diagrams_run_on_the_chosen_model_and_never_fail_the_run(tmp_db, fake, monkeypatch):
+    from axiom.orchestration import jobs, models
+    good = "<svg width=10 height=10><circle r=3 /></svg><script>1</script>"
+    _section([("paragraph", "Light cones tilt near the horizon."), ("paragraph", "Plain.")],
+             [dict(_unit("Light cones tilt.", ["b0"]), diagram_idea="Light cones at several r; slider for r."),
+              _unit("Plain.", ["b1"])])
+    monkeypatch.setattr(models, "available", lambda mid: mid in ("codex:default", "claude-code:sonnet", "local"))
+    routes = {"self-contained physics visualizations": lambda r: {"title": "Cones", "description_md": "Drag r.",
+                                                                  "html": good},
+              "meticulous physics reviewer": lambda r: {"errors": [], "notes": []}}
+    gen = fake(routes, "codex:default")
+    rev = fake(routes, "claude-code:sonnet")
+    assert models.load_routing()["auto_diagrams"] == "codex:default"
+    ids = jobs.enqueue_diagrams("d-s1.1")
+    assert len(ids) == 1 and jobs.enqueue_diagrams("d-s1.1") == ids  # one per suggested unit, idempotent
+    job = dict(db.q1("SELECT * FROM jobs WHERE id=?", (ids[0],)))
+    assert job["kind"] == "diagram" and job["model"] == "codex:default" and jobs.can_run(job)
+    out = jobs._run_diagram(job)
+    assert out["unit_id"] == "d-s1.1-u000"
+    assert "Light cones at several r" in gen.calls[0].user_text  # the optimizer's idea reaches the generator
+    assert rev.calls and "meticulous physics reviewer" in rev.calls[0].system  # reviewed by another vendor
+    v = json.loads(db.q1("SELECT data FROM visualizations WHERE unit_id='d-s1.1-u000'")["data"])
+    assert v["automatic"] and v["anchor_blocks"] == ["b0"]
+    # a rejected diagram is skipped, not a failure
+    monkeypatch.setitem(routes, "meticulous physics reviewer", lambda r: {"errors": ["wrong sign"], "notes": []})
+    db.q("DELETE FROM visualizations")
+    db.q("DELETE FROM llm_cache")  # same prompt: would otherwise reuse the passing review
+    db.conn().commit()
+    assert "skipped" in jobs._run_diagram(dict(job, profile="economy"))
+    models.save_routing(auto_diagrams="off")
+    db.q("DELETE FROM jobs")
+    db.conn().commit()
+    assert jobs.enqueue_diagrams("d-s1.1") == []

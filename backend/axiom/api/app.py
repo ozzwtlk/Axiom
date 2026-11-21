@@ -34,6 +34,12 @@ class ProcessRequest(BaseModel):
     model: str | None = None  # one model for transcription, rewriting and checks of this run; None = Settings
 
 
+class QualityRequest(BaseModel):
+    rerun: bool = False  # also queue what needs a model again (else: deterministic fixes only)
+    profile: str = "economy"
+    model: str | None = None
+
+
 class AnkiPushRequest(BaseModel):
     deck: str = "AXIOM"
     chapters: list[int] | None = None
@@ -52,6 +58,7 @@ class RoutingUpdate(BaseModel):
     groups: dict[str, str] = {}
     premium_default: str | None = None
     cloud_enabled: bool | None = None
+    auto_diagrams: str | None = None
 
 
 class QuizRequest(BaseModel):
@@ -109,6 +116,7 @@ def _unit(u: dict) -> Unit:
                           note=u.get("note")),
         flags=[Flag(**f) for f in u.get("flags", [])], figure_url=figure_url,
         verification=(u.get("verification") or {}).get("status"),
+        notes=[n for n in u.get("notes") or [] if n.get("kind") in ("key", "intuition", "pitfall", "recall", "check")],
     )
 
 
@@ -179,7 +187,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
     def put_routing(body: RoutingUpdate):
         from axiom.orchestration import models
         try:
-            return models.save_routing(body.groups, body.premium_default, body.cloud_enabled)
+            return models.save_routing(body.groups, body.premium_default, body.cloud_enabled, body.auto_diagrams)
         except ValueError as e:
             raise HTTPException(400, str(e))
 
@@ -207,26 +215,43 @@ def create_app(start_worker: bool = True) -> FastAPI:
 
     @app.post("/api/documents", response_model=DocumentSummary)
     async def upload(file: UploadFile = File(...)):
-        from axiom.ingestion.pdf import import_pdf
+        # Everything below blocks (disk, SQLite, PDF parsing) and must run off the event loop. On the server a
+        # worker may hold a server-side write transaction; a blocking SQLite write here would freeze the loop,
+        # so the worker's /internal/db/end could never be served → "database is locked" after 30 s → HTTP 500.
+        import asyncio
         if not (file.filename or "").lower().endswith(".pdf"):
             raise HTTPException(400, "only PDF files are supported")
         if role() == "server":  # store now; a computing machine imports it as soon as one is connected
-            from axiom.orchestration import jobs
             safe = re.sub(r"[^A-Za-z0-9._ -]+", "_", Path(file.filename).name)[:120]
-            rel = f"inbox/{uuid.uuid4().hex[:12]}__{safe}"
-            dest = settings.data_dir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(await file.read())
-            jobs.enqueue_import(rel)
+            await asyncio.to_thread(_store_in_inbox, file.file, safe)
             return JSONResponse({"queued": True, "filename": safe}, status_code=202)
+        doc_id = await asyncio.to_thread(_import_upload, file.file, Path(file.filename).name)
+        return _doc_summary(db.q1("SELECT * FROM documents WHERE id=?", (doc_id,)))
+
+    def _store_in_inbox(src, safe: str) -> str:
+        import shutil
+        from axiom.orchestration import jobs
+        rel = f"inbox/{uuid.uuid4().hex[:12]}__{safe}"
+        dest = settings.data_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_suffix(".part")
+        with open(part, "wb") as out:
+            shutil.copyfileobj(src, out, 1 << 20)
+        part.replace(dest)
+        jobs.enqueue_import(rel)
+        return rel
+
+    def _import_upload(src, name: str) -> str:
+        import shutil
+        from axiom.ingestion.pdf import import_pdf
         with tempfile.TemporaryDirectory() as td:
-            p = Path(td) / Path(file.filename).name
-            p.write_bytes(await file.read())
+            p = Path(td) / name
+            with open(p, "wb") as out:
+                shutil.copyfileobj(src, out, 1 << 20)
             try:
-                doc_id = import_pdf(p)
+                return import_pdf(p)
             except Exception as e:  # malformed PDF etc.
                 raise HTTPException(422, f"could not import PDF: {e}") from e
-        return _doc_summary(db.q1("SELECT * FROM documents WHERE id=?", (doc_id,)))
 
     @app.get("/api/documents/{doc_id}", response_model=DocumentDetail)
     def get_document(doc_id: str):
@@ -244,6 +269,19 @@ def create_app(start_worker: bool = True) -> FastAPI:
                           for s in secs]))
         return DocumentDetail(**_doc_summary(d).model_dump(), chapters=chapters)
 
+    @app.post("/api/documents/{doc_id}/restructure")
+    def restructure_document(doc_id: str, force: bool = False):
+        """Read the PDF outline again (chapters/sections); refused once text was extracted unless force=true."""
+        require_compute()
+        from axiom.ingestion.pdf import restructure
+        try:
+            r = restructure(doc_id, force)
+        except KeyError:
+            raise HTTPException(404, "document not found")
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+        return dict(r, document=get_document(doc_id).model_dump())
+
     @app.post("/api/documents/{doc_id}/process")
     def process(doc_id: str, body: ProcessRequest):
         from axiom.orchestration import jobs
@@ -257,6 +295,22 @@ def create_app(start_worker: bool = True) -> FastAPI:
             raise HTTPException(400, "parallel processing needs a premium model (Claude Code, Codex or an API); "
                                      "the local model has a single GPU")
         return {"job_ids": jobs.enqueue_document(doc_id, body.chapters, body.profile, model, body.parallel)}
+
+    @app.get("/api/documents/{doc_id}/quality")
+    def get_quality(doc_id: str):
+        """What the quality check fixed (page numbers, broken LaTeX, repeats ...) and what still needs a model."""
+        from axiom.verification.quality import document_report
+        return document_report(doc_id)
+
+    @app.post("/api/documents/{doc_id}/quality")
+    def run_quality(doc_id: str, body: QualityRequest):
+        """Check all processed sections (no model). `rerun`: queue the sections that still need a model again —
+        only their failed parts cost calls, the rest is cached."""
+        from axiom.orchestration import jobs
+        if not db.q1("SELECT 1 FROM documents WHERE id=?", (doc_id,)):
+            raise HTTPException(404, "document not found")
+        model = None if body.model in (None, "", "auto") else body.model
+        return {"job_ids": jobs.enqueue_quality(doc_id, body.rerun, body.profile, model)}
 
     @app.post("/api/jobs/reset")
     def reset_jobs(doc_id: str | None = None, include_done: bool = False):
@@ -285,6 +339,9 @@ def create_app(start_worker: bool = True) -> FastAPI:
         if not s:
             raise HTTPException(404, "section not found")
         units = [_unit(json.loads(r["data"])) for r in db.q("SELECT data FROM units WHERE section_id=? ORDER BY ord", (section_id,))]
+        with_viz = {r["unit_id"] for r in db.q("SELECT unit_id FROM visualizations WHERE unit_id LIKE ?", (section_id + "-u%",))}
+        for u in units:
+            u.has_visualization = u.id in with_viz
         # equation numbers come from the source block (single source of truth; fixes propagate without re-optimizing)
         eqnums = {r["id"]: r["eq_number"] for r in db.q(
             "SELECT id, eq_number FROM blocks WHERE section_id=? AND block_type='equation'", (section_id,))}
@@ -305,6 +362,13 @@ def create_app(start_worker: bool = True) -> FastAPI:
                            verified=s["stage"] == "verified" and bool(units), units=units, exercises=exercises,
                            prev_section_id=ids[i - 1] if i > 0 else None,
                            next_section_id=ids[i + 1] if i + 1 < len(ids) else None)
+
+    @app.get("/api/documents/{doc_id}/xrefs")
+    def get_xrefs(doc_id: str):
+        from axiom.verification.xrefs import xrefs
+        if not db.q1("SELECT 1 FROM documents WHERE id=?", (doc_id,)):
+            raise HTTPException(404, "document not found")
+        return xrefs(doc_id)
 
     @app.get("/api/blocks/{block_id}", response_model=SourceBlock)
     def get_block(block_id: str):
@@ -514,7 +578,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
             raise HTTPException(404, "no visualization yet")
         d = json.loads(row["data"])
         return {k: d.get(k) for k in ("unit_id", "title", "description_md", "model", "ai_generated", "reviewed",
-                                      "review_notes")}
+                                      "review_notes", "automatic")}
 
     @app.post("/api/units/{unit_id}/visualization")
     def make_viz(unit_id: str, regenerate: bool = False, model: str | None = None):
@@ -534,14 +598,18 @@ def create_app(start_worker: bool = True) -> FastAPI:
                                       "review_notes")}
 
     @app.get("/api/units/{unit_id}/visualization.html", include_in_schema=False)
-    def viz_html(unit_id: str):
+    def viz_html(unit_id: str, download: bool = False):
         from axiom.visualization.generate import CSP, document
         row = db.q1("SELECT data FROM visualizations WHERE unit_id=?", (unit_id,))
         if not row:
             raise HTTPException(404, "no visualization yet")
-        return Response(document(json.loads(row["data"])), media_type="text/html",
-                        headers={"Content-Security-Policy": CSP, "X-Content-Type-Options": "nosniff",
-                                 "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
+        v = json.loads(row["data"])
+        headers = {"Content-Security-Policy": CSP, "X-Content-Type-Options": "nosniff",
+                   "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"}
+        if download:  # the saved file keeps its own CSP <meta> (no network) when opened locally
+            name = re.sub(r"[^A-Za-z0-9._-]+", "-", v.get("title") or unit_id).strip("-")[:80] or "visualization"
+            headers["Content-Disposition"] = f'attachment; filename="{name}.html"'
+        return Response(document(v), media_type="text/html", headers=headers)
 
     dist = REPO_ROOT / "frontend" / "dist"
     if dist.exists():

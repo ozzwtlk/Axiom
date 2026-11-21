@@ -718,3 +718,41 @@ h3.unit-heading { font-size: 1.3rem; margin: 2rem 0 0.6rem; }
 .menu-machine .machine-picker select { max-width: none; flex: 1; }
 @media (max-width: 640px) { .header-right > .machine-picker { display: none; } }
 @media (min-width: 641px) { .menu-machine { display: none; } }
+
+/* ---- study notes (AI) ---- */
+.study-notes { margin: 0.7rem 0 0.2rem; display: grid; gap: 0.4rem; }
+.study-notes > .ai-tag { justify-self: start; }
+.study-note {
+  --note: var(--c-blue);
+  border-left: 3px solid var(--note); background: color-mix(in srgb, var(--note) var(--tint), transparent);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0; padding: 0.35rem 0.7rem; font-size: 0.94em;
+}
+.study-note .md > :first-child { margin-top: 0; }
+.study-note .md > :last-child { margin-bottom: 0; }
+.note-label { font-family: var(--sans); font-size: 0.68rem; font-weight: 650; text-transform: uppercase; letter-spacing: 0.07em; color: var(--note); }
+.note-key { --note: var(--accent); }
+.note-intuition { --note: var(--c-green); }
+.note-pitfall { --note: var(--c-vermillion); }
+.note-recall { --note: var(--c-grey); }
+.note-check { --note: var(--c-purple); }
+
+/* ---- cross-references ---- */
+a.xref { color: var(--accent); text-decoration: underline dotted color-mix(in srgb, var(--accent) 55%, transparent); text-underline-offset: 0.18em; cursor: pointer; }
+a.xref:hover { text-decoration-style: solid; }
+.xref-preview {
+  position: fixed; z-index: 60; max-width: min(430px, calc(100vw - 16px)); max-height: 60vh; overflow: auto;
+  background: var(--bg-elev); color: var(--fg); border: 1px solid var(--border-strong); border-radius: var(--radius);
+  box-shadow: var(--shadow-pop); padding: 0.6rem 0.8rem; pointer-events: none;
+}
+.xref-preview img { max-width: 100%; display: block; margin-bottom: 0.4rem; border-radius: var(--radius-sm); }
+.xref-preview .equation { margin: 0.2rem 0; }
+.xref-hint { margin-top: 0.3rem; }
+.viz-actions { margin-top: 0.3rem; }
+
+/* quality check panel */
+.quality-list, .quality-sections { list-style: none; margin: 0.4rem 0; padding: 0; }
+.quality-list li, .quality-sections li { margin: 0.15rem 0; }
+.quality-n { display: inline-block; min-width: 2.2em; font-variant-numeric: tabular-nums; font-weight: 600; }
+.quality-n.ok { color: var(--c-green, inherit); }
+.quality-sections { max-height: 14rem; overflow-y: auto; }
+.quality-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.5rem; }

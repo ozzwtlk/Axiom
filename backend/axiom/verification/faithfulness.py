@@ -23,10 +23,10 @@ from axiom.storage import db
 
 log = logging.getLogger("axiom.faithfulness")
 
-PROMPT_VERSION = "faithful-v2"  # v2: neighbouring blocks shown as context (split equations, "cut-off" sources)
+PROMPT_VERSION = "faithful-v3"  # v2: neighbouring blocks as context; v3: study notes, equation notes, AI derivation steps
 CONTEXT_CHARS = 700
 MAX_SOURCE_CHARS = 3500
-MAX_UNITS = 10
+MAX_UNITS = 6  # units now carry deep dives with derivations and notes: smaller batches
 CHECKED_KINDS = {"prose", "definition", "theorem", "result", "warning", "example", "remark", "aside"}
 
 SYSTEM = (
@@ -44,8 +44,12 @@ Report a problem only when it is real:
 - "dropped_condition": a result is stated without an assumption, qualifier or caveat that the source attaches to
   it, so the statement becomes wrong or over-general.
 - "unsupported": the main or fast version asserts a substantive fact that is not in the source.
-Not problems: paraphrase, compression, reordering, signposting, omitted *detail* that does not change truth, and
-notation that matches the source. The "deep" version is meant to add explanation: report it only if contradicted.
+Not problems: paraphrase, compression, reordering, signposting, emphasis, omitted *detail* that does not change
+truth, and notation that matches the source.
+The "deep" version, the "notes" and an equation's "annotation" are MEANT to add explanation, intuition and
+derivation steps that are not in the source: report them only as "contradicted", when they are false. Check
+every equation they add step by step (signs, factors, indices, conventions of the source) -- a wrong added step
+is "contradicted".
 Equations shown in the source are verbatim and correct; check the rewrite's claims about them.
 CONTEXT blocks are the text immediately before/after the cited blocks (a sentence or equation often continues
 there): a claim supported by CONTEXT is supported, and a source that seems to stop mid-sentence continues in it.
@@ -62,7 +66,7 @@ def _schema(unit_ids: list[str]) -> dict:
             "required": ["unit", "field", "verdict", "claim", "explanation", "source_evidence"],
             "properties": {
                 "unit": {"type": "string", "enum": unit_ids},
-                "field": {"type": "string", "enum": ["text", "fast", "deep"]},
+                "field": {"type": "string", "enum": ["text", "fast", "deep", "notes", "annotation"]},
                 "verdict": {"type": "string", "enum": ["contradicted", "dropped_condition", "unsupported"]},
                 "claim": {"type": "string"}, "explanation": {"type": "string"},
                 "source_evidence": {"type": "string"},
@@ -75,6 +79,8 @@ def _block_md(b) -> str:
 
 
 def needs_check(u: dict) -> bool:
+    if u.get("kind") == "equation":  # the LaTeX is verbatim; only the AI's explanations around it are checked
+        return bool(u.get("annotation_md") or u.get("deep_md") or u.get("notes"))
     return (u.get("kind") in CHECKED_KINDS and bool(u.get("ai_generated"))
             and u.get("coverage") in ("rewritten", "merged", "condensed")
             and bool((u.get("text_md") or "").strip()))
@@ -129,11 +135,19 @@ def _prompt(batch: list[dict], blocks: dict[str, dict]) -> tuple[str, dict[str, 
                  + ",".join(sid[b] for b in u["block_ids"] if b in sid)]
         if u.get("title"):
             lines.append(f"title: {u['title']}")
-        lines.append(f"text: {u['text_md']}")
+        if u.get("kind") == "equation":
+            lines.append(f"equation (verbatim from the source): $${u.get('latex') or ''}$$"
+                         + (f" ({u['eq_number']})" if u.get("eq_number") else ""))
+            if u.get("annotation_md"):
+                lines.append(f"annotation: {u['annotation_md']}")
+        else:
+            lines.append(f"text: {u['text_md']}")
         if u.get("fast_md"):
             lines.append(f"fast: {u['fast_md']}")
         if u.get("deep_md"):
             lines.append(f"deep: {u['deep_md']}")
+        for n in u.get("notes") or []:
+            lines.append(f"notes ({n['kind']}): {n['md']}")
         rw_lines.append("\n".join(lines))
     user = (TASK + "\n\nSOURCE:\n" + "\n\n".join(src_lines)
             + ("\n\nCONTEXT (neighbouring text, not cited):\n" + "\n\n".join(ctx_lines) if ctx_lines else "")
@@ -152,10 +166,13 @@ def apply_verdicts(u: dict, problems: list[dict], blocks: dict[str, dict], model
     flags = [f for f in u.get("flags", []) if f.get("kind") not in ("unverified_claim", "reverted")]
     status = "verified"
     text_bad = [p for p in problems if p["field"] == "text" and p["verdict"] == "contradicted"]
+    if u.get("kind") == "equation":  # the equation itself is the source's; never touch it
+        text_bad = []
+        problems = [p for p in problems if p["field"] != "text"]
     if text_bad:
         src = _source_text(u, blocks)
         if src:
-            u.update(text_md=src, fast_md=None, deep_md=None, coverage="preserved", ai_generated=False)
+            u.update(text_md=src, fast_md=None, deep_md=None, notes=[], coverage="preserved", ai_generated=False)
             flags.append({"kind": "reverted", "message": "An independent check found the rewrite inaccurate ("
                           + text_bad[0]["explanation"][:240] + "). Showing the original text."})
             status = "reverted"
@@ -163,11 +180,13 @@ def apply_verdicts(u: dict, problems: list[dict], blocks: dict[str, dict], model
             flags.append({"kind": "unverified_claim", "message": text_bad[0]["explanation"][:300]})
             status = "flagged"
     else:
-        for field, key in (("fast", "fast_md"), ("deep", "deep_md")):
+        labels = {"fast": "Fast Track version", "deep": "Deep Dive explanation", "notes": "study notes",
+                  "annotation": "AI note on the equation"}
+        for field, key in (("fast", "fast_md"), ("deep", "deep_md"), ("notes", "notes"), ("annotation", "annotation_md")):
             if any(p["field"] == field and p["verdict"] == "contradicted" for p in problems) and u.get(key):
-                u[key] = None
-                flags.append({"kind": "info", "message": f"The {'Fast Track' if field == 'fast' else 'Deep Dive'}"
-                              " version was removed because an independent check found it inaccurate."})
+                u[key] = [] if key == "notes" else None  # drop, never rewrite
+                flags.append({"kind": "info", "message": f"The {labels[field]} was removed because an independent"
+                              " check found it inaccurate."})
                 status = "flagged"
         for p in problems:
             if p["verdict"] in ("dropped_condition", "unsupported") and p["field"] in ("text", "fast"):

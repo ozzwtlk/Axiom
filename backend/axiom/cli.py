@@ -52,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("anki"); p.add_argument("doc_id"); p.add_argument("--format", default="apkg", choices=["apkg", "tsv", "push"])
     p.add_argument("--deck", default="AXIOM"); p.add_argument("--chapters"); p.add_argument("--out")
     p = sub.add_parser("refit-crops"); p.add_argument("doc_id")
+    p = sub.add_parser("restructure", help="read a document's PDF outline again (chapters / sections)")
+    p.add_argument("doc_id"); p.add_argument("--force", action="store_true", help="discard extracted text")
     a = ap.parse_args(argv)
     if a.cmd == "worker":  # token only from the environment (not visible in the process list)
         if not a.server:
@@ -68,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
         doc_id = import_pdf(Path(a.pdf), a.title)
         n = db.q1("SELECT COUNT(*) n FROM chapters WHERE doc_id=?", (doc_id,))["n"]
         print(json.dumps({"doc_id": doc_id, "chapters": n}))
+    elif a.cmd == "restructure":
+        from axiom.ingestion.pdf import restructure
+        print(json.dumps(restructure(a.doc_id, a.force)))
     elif a.cmd == "stage":
         from axiom.extraction.extract import extract_chapter
         from axiom.transformations.transcribe import transcribe_section

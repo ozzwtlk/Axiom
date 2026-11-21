@@ -23,6 +23,7 @@ EQ_TAG_RE = re.compile(r"^\(\s*([\dlI]+)\s*\.\s*([\dlI]+)\s*\)[.,;]?$")
 def _fix_digits(s: str) -> str:
     return s.replace("l", "1").replace("I", "1")
 SECTION_HEAD_RE = re.compile(r"^\s*(\d+)\s*\.\s*(\d+)\s*[•·]\s*(.+)$")
+FOLIO_LINE = re.compile(r"\s*[-–—]?\s*(?:page\s+)?\d{1,4}\s*[-–—]?\s*", re.I)  # "12", "- 4 -", "– 4 –"
 FIGURE_RE = re.compile(r"^\s*FIGURE\s+(\d+\s*\.\s*\d+)", re.I)
 EXERCISE_ITEM_RE = re.compile(r"^\s*(\d{1,2})\s*\.\s+\S")
 GREEK_OR_SYMBOL = re.compile(r"[µαβγδεζηθικλνξπρστυφχψωΓΔΘΛΞΠΣΦΨΩ∂∇∫∑∏±≤≥≠≈∞→←↔⊗⊕√~^_{}\\|<>=]")
@@ -221,11 +222,12 @@ def estimate_geometry(rows: list[Row], page_height: float) -> PageGeometry:
     first = min(rows, key=lambda r: r.y0)
     # running head: top row in the top band carrying a folio number (e.g. "1.3 Lorentz Transformations 13")
     if first.y1 < 0.11 * page_height and (re.search(r"(^\s*\d{1,4}\s)|(\s\d{1,4}\s*$)", first.text)
+                                          or FOLIO_LINE.fullmatch(first.text)
                                           or re.search(r"\bChapter\b", first.text)):
         header_bottom = max(r.y1 for r in rows if r.y0 < first.y1 - 2)
     footer_top = page_height
     for r in rows:  # folio at the bottom (chapter openers)
-        if r.y0 > 0.88 * page_height and re.fullmatch(r"\s*\d{1,4}\s*", r.text):
+        if r.y0 > 0.88 * page_height and FOLIO_LINE.fullmatch(r.text):
             footer_top = min(footer_top, r.y0)
     return PageGeometry(left, right, body_size, pitch, header_bottom, footer_top)
 

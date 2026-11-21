@@ -151,11 +151,17 @@ def load_routing() -> dict:
             "premium_default": d.get("premium_default", "auto"),
             # "auto" may send passages to cloud models only after the user switched this on (privacy by default);
             # a model the user picks explicitly (here per group, or per request) is always honoured
-            "cloud_enabled": bool(d.get("cloud_enabled", False))}
+            "cloud_enabled": bool(d.get("cloud_enabled", False)),
+            # diagrams generated automatically while a book is processed: "off" or an explicit model id (a user
+            # choice, like a per-group setting, so it does not depend on cloud_enabled)
+            "auto_diagrams": d.get("auto_diagrams", AUTO_DIAGRAMS_DEFAULT)}
+
+
+AUTO_DIAGRAMS_DEFAULT = "codex:default"
 
 
 def save_routing(groups: dict[str, str] | None = None, premium_default: str | None = None,
-                 cloud_enabled: bool | None = None) -> dict:
+                 cloud_enabled: bool | None = None, auto_diagrams: str | None = None) -> dict:
     cur = load_routing()
     ids = {m["id"] for m in catalog()} | {"auto"}
     for gid, mid in (groups or {}).items():
@@ -172,6 +178,10 @@ def save_routing(groups: dict[str, str] | None = None, premium_default: str | No
         cur["premium_default"] = premium_default
     if cloud_enabled is not None:
         cur["cloud_enabled"] = bool(cloud_enabled)
+    if auto_diagrams is not None:
+        if auto_diagrams != "off" and (auto_diagrams not in ids or auto_diagrams == "auto"):
+            raise ValueError(f"unknown model {auto_diagrams!r} for automatic diagrams")
+        cur["auto_diagrams"] = auto_diagrams
     with db.connect() as c:
         c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)", (ROUTING_KEY, json.dumps(cur)))
     return cur

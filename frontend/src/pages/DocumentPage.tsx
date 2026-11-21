@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ankiUrl, getDocument, getMastery, getProgress, MOCK, pageImageUrl, processDocument, pushToAnki } from "../api/client";
+import { ankiUrl, getDocument, getMastery, getProgress, MOCK, pageImageUrl, processDocument, pushToAnki, restructureDocument } from "../api/client";
 import type { DocumentDetail, Profile, ProgressReport } from "../api/types";
 import { jobsRunning, ProgressPanel } from "../components/ProgressPanel";
+import { QualityPanel } from "../components/QualityPanel";
 import { Icon } from "../components/Icon";
 import { SearchBox } from "../components/SearchBox";
 import { isOpenable, StatusBadge } from "../components/StatusBadge";
@@ -111,7 +112,24 @@ export function DocumentPage() {
           <span className="eyebrow">Textbook</span>
           <h1>{doc.title}</h1>
           <div className="doc-hero-meta">
-            {doc.page_count} pages · {doc.chapters.length} chapters
+            {doc.page_count} pages · {doc.chapters.length} chapters ·{" "}
+            <button
+              type="button"
+              className="link-btn"
+              title="Read the chapters and sections from the PDF outline again (only before processing starts)"
+              onClick={async () => {
+                setErr(null);
+                try {
+                  const r = await restructureDocument(doc.id);
+                  await refresh();
+                  if (!r.changed) setErr("The PDF has no usable outline; the document stays one section.");
+                } catch (e) {
+                  setErr(e instanceof Error ? e.message : String(e));
+                }
+              }}
+            >
+              re-read outline
+            </button>
           </div>
           <div className="doc-hero-progress">
             <div className="bar" aria-label={`${doc.chapters_done} of ${doc.chapters_total} chapters ready`}>
@@ -306,6 +324,16 @@ export function DocumentPage() {
               </div>
             </section>
           )}
+          <QualityPanel
+            docId={doc.id}
+            model={procModel}
+            profile={profile}
+            tick={(progress?.sections_done ?? 0) * 1000 + (progress?.jobs.filter((j) => j.status === "done").length ?? 0)}
+            onStarted={() => {
+              setKick(3);
+              refresh();
+            }}
+          />
           {progress && <ProgressPanel p={progress} polling={polling} />}
         </div>
       </div>

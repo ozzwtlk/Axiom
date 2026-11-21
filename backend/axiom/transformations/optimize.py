@@ -10,6 +10,8 @@ Hard rules enforced here in code (not trusted to the prompt):
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -24,8 +26,11 @@ from axiom.verification import latex
 
 log = logging.getLogger("axiom.optimize")
 
-PROMPT_VERSION = "optimize-v2"
+PROMPT_VERSION = "optimize-v3"  # v3: teaching text — emphasis, study notes, real deep dives with derivation steps,
+#                                   diagram suggestions
 MAX_WINDOW_CHARS = 3600
+MAX_OUTPUT_TOKENS = 16000
+NOTE_KINDS = ["key", "intuition", "pitfall", "recall", "check"]
 LLM_BLOCK_TYPES = ("paragraph", "equation", "exercise")
 
 ROLES = [
@@ -45,31 +50,53 @@ You receive numbered source blocks (B1, B2, ...) from one section. Produce reade
 
 Rules:
 1. Every equation block (type=equation) becomes exactly one unit with kind="equation" and source_ids=[that id]. \
-Leave text_md empty for it: the system inserts the author's LaTeX verbatim. You may give a one-sentence \
-annotation_md saying what the equation means or why it matters (no new mathematics there).
-2. Prose: rewrite for speed and clarity. Keep every definition, assumption, condition of validity, caveat, sign \
-convention, special case and logical step. Remove only genuine repetition and verbal padding. Where the author \
-skips a non-obvious step, you may add the missing explanation in deep_md (it is shown labelled as AI-added).
-3. Mathematics inside prose: copy the author's inline math exactly as given in the source ($...$). Never change \
-notation, index placement, signs or conventions. Never invent new numbered equations. Refer to equations by \
-their numbers, e.g. "(1.29)".
-4. kind: definition | theorem | result (an important final result) | warning (caveat / common pitfall) | \
+Leave text_md empty for it: the system inserts the author's LaTeX verbatim. annotation_md: say in words what \
+the equation states and what every symbol in it that is new here means (1-3 sentences, no new mathematics).
+2. text_md (the Standard level) is a TEACHING text, not a paraphrase. Explain the passage better than the book \
+does while keeping every definition, assumption, condition of validity, caveat, sign convention, special case \
+and logical step:
+   - open a unit that argues something with what is being shown and why it matters, then give the steps;
+   - break long arguments into short steps or a numbered list; one idea per sentence;
+   - **bold** each term where it is defined and the single central claim of the unit (1-3 bold phrases per unit);
+   - say explicitly which earlier equation or result is used, by number, e.g. "using (1.29)";
+   - remove only genuine repetition and verbal padding.
+3. Mathematics inside text_md / fast_md: copy the author's inline math exactly as given in the source ($...$). \
+Never change notation, index placement, signs or conventions. Never invent new numbered equations. Refer to \
+equations by their numbers, e.g. "(1.29)".
+4. deep_md (the Deep Dive level, shown labelled "AI-added"): a genuine deeper explanation for every unit with real \
+content (definitions, results, derivations, examples, and equations whose step is not obvious); null only for \
+trivial units (signposting, repetition). Do at least one of, as fits:
+   (a) fill in the steps the author skips, as display equations $$...$$, each step with a short justification;
+   (b) the physical meaning of each term, and why the result has this form;
+   (c) a limiting case, special case, dimensional or sign check, worked with explicit math;
+   (d) how this connects to earlier results (cite their equation numbers) and what it is used for next.
+   Equations you add here must be exact, in the author's notation, sign and index conventions, and must never \
+carry an equation number. Typically 80-250 words.
+5. notes: 0-3 short study notes per unit (each one or two sentences, may use $...$), of kind \
+key (the one thing to remember) | intuition (a physical picture) | pitfall (a common misreading, sign or \
+convention trap) | recall (an earlier definition or result this relies on, with its equation number) | \
+check (a quick sanity check: limit, units, special case). Only notes that genuinely help; none for trivial units. \
+Notes must be correct; they are shown labelled as AI-written.
+6. kind: definition | theorem | result (an important final result) | warning (caveat / common pitfall) | \
 example | remark | aside (history, motivation, digressions) | prose.
-5. min_level: 1 = needed on the fastest path to doing exercises (definitions, assumptions, key results, key \
+7. min_level: 1 = needed on the fastest path to doing exercises (definitions, assumptions, key results, key \
 equations, essential caveats, essential intuition); 2 = standard study (reasoning, derivation steps, examples); \
 3 = optional (history, motivation, digressions, advanced remarks).
-6. fast_md: for level-1 units whose text_md is longer than ~2 sentences, a compressed version (keep the \
+8. fast_md: for level-1 units whose text_md is longer than ~2 sentences, a compressed version (keep the \
 mathematics exact). Otherwise null.
-7. coverage per unit: preserved (essentially the original wording), rewritten, merged (several blocks combined), \
+9. coverage per unit: preserved (essentially the original wording), rewritten, merged (several blocks combined), \
 expandable (kept, but only as optional level-3 material), omitted (pure repetition; omission_reason required). \
 Every source id must appear in some unit's source_ids.
-8. title: for definitions/theorems/results, the term or a short name; else null.
-9. Also extract notation introduced or used here (symbol in LaTeX, meaning, convention such as metric signature \
+10. title: for definitions/theorems/results, the term or a short name; else null.
+11. diagram: null, or -- only when a picture would substantially help (geometry, causal structure / light cones, \
+a potential, trajectories, an embedding, a plot of a key function) -- one concrete sentence describing an \
+interactive diagram (what is drawn, what the slider changes). At most one per passage; most passages: none.
+12. Also extract notation introduced or used here (symbol in LaTeX, meaning, convention such as metric signature \
 or index placement) and the concepts (name, kind, one-line summary, prerequisite concept names).
-10. summary: 2-4 sentences summarizing what this passage establishes (for later context).
-11. Faithfulness: never merge two distinct definitions into one (e.g. a group and its subgroup, O(3) vs SO(3)); keep every named object with exactly the author's name and defining property. Never generalize a statement beyond what the author says, and never attribute a property to an object the author did not attribute it to.
-12. Keep the author's remarks about conventions and notation ("we will not bother to distinguish...", "we use units where c = 1", index conventions): they matter later. Keep such remarks at min_level 1 or 2.
-13. If a level-1 unit relies on an equation or condition, that equation/condition must also be min_level 1."""
+13. summary: 2-4 sentences summarizing what this passage establishes (for later context).
+14. Faithfulness: never merge two distinct definitions into one (e.g. a group and its subgroup, O(3) vs SO(3)); keep every named object with exactly the author's name and defining property. Never generalize a statement beyond what the author says, and never attribute a property to an object the author did not attribute it to. This applies to deep_md and notes too.
+15. Keep the author's remarks about conventions and notation ("we will not bother to distinguish...", "we use units where c = 1", index conventions): they matter later. Keep such remarks at min_level 1 or 2.
+16. If a level-1 unit relies on an equation or condition, that equation/condition must also be min_level 1."""
 
 
 def _schema(ids: list[str]) -> dict:
@@ -91,9 +118,14 @@ def _schema(ids: list[str]) -> dict:
                     "annotation_md": nullable_str,
                     "coverage": {"type": "string", "enum": COVERAGE},
                     "omission_reason": nullable_str,
+                    "notes": {"type": "array", "maxItems": 3, "items": {
+                        "type": "object",
+                        "properties": {"kind": {"type": "string", "enum": NOTE_KINDS}, "md": {"type": "string"}},
+                        "required": ["kind", "md"]}},
+                    "diagram": nullable_str,
                 },
                 "required": ["source_ids", "kind", "role", "min_level", "title", "text_md", "fast_md", "deep_md",
-                             "annotation_md", "coverage", "omission_reason"],
+                             "annotation_md", "coverage", "omission_reason", "notes", "diagram"],
             }},
             "notation": {"type": "array", "items": {
                 "type": "object",
@@ -219,6 +251,7 @@ def _validator(w: Window, ids: dict[str, str]):
             if u["coverage"] == "omitted" and not (u.get("omission_reason") or "").strip():
                 raise ValidationFailed("omitted coverage requires omission_reason")
             md_items += [u.get(k) or "" for k in ("text_md", "fast_md", "deep_md", "annotation_md")]
+            md_items += [n.get("md") or "" for n in (u.get("notes") or [])]
         missing = [s for s in ids.values() if s not in seen]
         if len(missing) > max(2, 0.3 * len(ids)):
             raise ValidationFailed(f"too many source blocks not covered: {missing}")
@@ -309,7 +342,7 @@ def optimize_section(section_id: str, profile: str = "economy", should_stop=lamb
         by_id = {b["id"]: b for b in w.blocks}
         user = (_context(sec, doc_id, prev_tail) + "\n\n=== SOURCE BLOCKS ===\n\n" + _render_window(w, ids)
                 + "\n\n=== END SOURCE ===\nReturn the JSON object.")
-        req = ChatRequest(SYSTEM, user, json_schema=_schema(list(ids.values())), max_tokens=9000,
+        req = ChatRequest(SYSTEM, user, json_schema=_schema(list(ids.values())), max_tokens=MAX_OUTPUT_TOKENS,
                           thinking=prof.optimize_thinking)
         try:
             data, meta = llm.call_json("optimize", models.resolve("optimize", None, profile, local_as="local_text"), req, PROMPT_VERSION, _validator(w, ids),
@@ -336,7 +369,11 @@ def optimize_section(section_id: str, profile: str = "economy", should_stop=lamb
                 "text_md": u.get("text_md") or "", "fast_md": u.get("fast_md"), "deep_md": u.get("deep_md"),
                 "annotation_md": u.get("annotation_md"), "block_ids": bids, "coverage": u["coverage"],
                 "note": u.get("omission_reason"), "ai_generated": u["coverage"] != "preserved", "flags": flags,
+                "notes": [{"kind": n["kind"], "md": n["md"].strip()} for n in (u.get("notes") or [])
+                          if n.get("kind") in NOTE_KINDS and (n.get("md") or "").strip()][:3],
             }
+            if (u.get("diagram") or "").strip():
+                out["diagram_idea"] = u["diagram"].strip()[:400]
             if u["kind"] == "equation":
                 src = by_id[bids[0]]
                 disp, rest = _display_latex(_block_text(src))
@@ -494,10 +531,48 @@ def _attach_captions(units: list[tuple[int, dict]]) -> None:
         i += 1
 
 
+def _carry_visualizations(c, section_id: str, new_units: list[dict]) -> None:
+    """Unit ids are positional, so re-optimizing a section would leave its saved visualizations pointing at the
+    wrong unit (or none). Each visualization is anchored to source blocks; move it to the new unit that covers
+    the most of them. One without a home is kept detached (never deleted) so it can be re-attached later."""
+    rows = c.execute("SELECT unit_id, doc_id, data, created_at FROM visualizations WHERE unit_id LIKE ?"
+                     " OR unit_id LIKE ?", (section_id + "-u%", f"detached:{section_id}:%")).fetchall()
+    if not rows:
+        return
+    old_blocks = {r["id"]: json.loads(r["data"]).get("block_ids", [])
+                  for r in c.execute("SELECT id, data FROM units WHERE section_id=?", (section_id,)).fetchall()}
+    c.execute("DELETE FROM visualizations WHERE unit_id LIKE ? OR unit_id LIKE ?",
+              (section_id + "-u%", f"detached:{section_id}:%"))
+    taken: set[str] = set()
+    for r in sorted(rows, key=lambda r: r["created_at"], reverse=True):  # newest wins a contested unit
+        v = json.loads(r["data"])
+        anchor = set(v.get("anchor_blocks") or old_blocks.get(r["unit_id"], []))
+        best, score = None, 0.0
+        for u in new_units:
+            if u["id"] in taken or u["kind"] in ("heading", "figure"):
+                continue
+            inter = len(anchor & set(u["block_ids"]))
+            s = inter / len(anchor | set(u["block_ids"])) if inter else 0.0
+            if s > score:
+                best, score = u, s
+        if best is not None:
+            taken.add(best["id"])
+            uid = best["id"]
+            v.update(unit_id=uid, anchor_blocks=sorted(anchor))
+        else:
+            uid = f"detached:{section_id}:{hashlib.sha1(','.join(sorted(anchor)).encode()).hexdigest()[:10]}"
+            v.update(unit_id=uid, anchor_blocks=sorted(anchor))
+        c.execute("INSERT OR REPLACE INTO visualizations(unit_id, doc_id, data, created_at) VALUES (?,?,?,?)",
+                  (uid, r["doc_id"], db.jdump(v), r["created_at"]))
+
+
 def _store(section_id: str, doc_id: str, units: list[dict], summaries: list[str], notation: list[dict],
            concepts: list[dict]) -> None:
     pages = {r["id"]: r["page"] for r in db.q("SELECT id, page FROM blocks WHERE section_id=?", (section_id,))}
+    for i, u in enumerate(units):
+        u["id"] = f"{section_id}-u{i:03d}"
     with db.connect() as c:
+        _carry_visualizations(c, section_id, units)
         c.execute("DELETE FROM units WHERE section_id=?", (section_id,))
         c.execute("DELETE FROM coverage WHERE section_id=?", (section_id,))
         c.execute("DELETE FROM notation WHERE section_id=?", (section_id,))
@@ -505,14 +580,18 @@ def _store(section_id: str, doc_id: str, units: list[dict], summaries: list[str]
         c.execute("DELETE FROM search_fts WHERE section_id=? AND block_id LIKE ?", (section_id, section_id + "-u%"))
         cov: dict[str, tuple[str, list[str], str | None]] = {}
         for i, u in enumerate(units):
-            uid = f"{section_id}-u{i:03d}"
-            u["id"] = uid
+            uid = u["id"]
             u["pages"] = sorted({pages[b] for b in u["block_ids"] if b in pages})
             c.execute("INSERT INTO units(id, section_id, ord, data) VALUES (?,?,?,?)", (uid, section_id, i, db.jdump(u)))
             for b in u["block_ids"]:
                 status = "merged" if (len(u["block_ids"]) > 1 and u["coverage"] not in ("omitted", "expandable")) else u["coverage"]
                 prev = cov.get(b)
                 cov[b] = (status if not prev else prev[0], (prev[1] if prev else []) + [uid], u.get("note"))
+        for r in c.execute("SELECT id, flags FROM blocks WHERE section_id=? AND block_type='artifact'", (section_id,)):
+            if r["id"] not in cov:  # page numbers, repeated lines (verification/quality.py): accounted for, not shown
+                why = next((f["message"] for f in json.loads(r["flags"] or "[]") if f.get("kind") == "info"),
+                           "Not part of the text")
+                cov[r["id"]] = ("omitted", [], why)
         for b, (status, uids, note) in cov.items():
             c.execute("INSERT OR REPLACE INTO coverage(block_id, section_id, status, unit_ids, note) VALUES (?,?,?,?,?)",
                       (b, section_id, status, db.jdump(uids), note))

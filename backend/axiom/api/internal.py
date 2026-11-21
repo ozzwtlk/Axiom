@@ -268,13 +268,17 @@ def install(app: FastAPI) -> None:
     @r.put("/files/{rel:path}")
     async def put_file(rel: str, request: Request):
         p = _safe_rel(rel)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".part")
-        tmp.write_bytes(await request.body())
-        if p.exists():
-            p.chmod(0o644)
-        tmp.replace(p)
-        return {"ok": True, "bytes": p.stat().st_size}
+        body = await request.body()
+
+        def _write() -> int:  # disk I/O off the event loop (large PDFs on an SD card)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(p.suffix + ".part")
+            tmp.write_bytes(body)
+            if p.exists():
+                p.chmod(0o644)
+            tmp.replace(p)
+            return p.stat().st_size
+        return {"ok": True, "bytes": await asyncio.to_thread(_write)}
 
     @r.delete("/files/{rel:path}")
     def delete_file(rel: str):

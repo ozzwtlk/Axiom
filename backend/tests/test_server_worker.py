@@ -134,6 +134,28 @@ def test_upload_goes_to_the_inbox_until_a_machine_imports_it(server):
     assert any(p.name.endswith("__notes.pdf") for p in (server["data"] / "inbox").iterdir())
 
 
+def test_upload_while_a_worker_holds_a_transaction(server):
+    """Regression: the upload handler wrote SQLite on the event loop. While a worker held a server-side
+    transaction (its job poll does, every second) the loop froze, the worker's commit could not be served,
+    and the upload died with 'database is locked' → HTTP 500 after 30 s."""
+    import pymupdf
+    h = {"Authorization": f"Bearer {TOKEN}"}
+    tx = httpx.post(server["url"] + "/internal/db/begin", json={}, headers=h).json()["tx"]
+    d = pymupdf.open()
+    d.new_page().insert_text((72, 72), "hello")
+    out = {}
+    t = threading.Thread(target=lambda: out.update(r=httpx.post(
+        server["url"] + "/api/documents", files={"file": ("locked.pdf", d.tobytes(), "application/pdf")}, timeout=60)))
+    t.start()
+    time.sleep(0.5)  # the upload is now waiting for the write lock
+    t0 = time.monotonic()
+    assert httpx.post(server["url"] + "/internal/db/end", json={"tx": tx, "commit": True}, headers=h,
+                      timeout=10).status_code == 200
+    assert time.monotonic() - t0 < 5  # the worker's commit is served while the upload waits
+    t.join(30)
+    assert out["r"].status_code == 202
+
+
 def test_jobs_only_run_on_the_chosen_machine_with_the_needed_model(remote, monkeypatch):
     from axiom.orchestration import jobs, models
     from axiom.storage import db

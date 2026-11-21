@@ -115,6 +115,9 @@ def reconcile(doc_id: str, chapters: list[int], profile: str = "economy", should
             raise InterruptedError
         if db.q1("SELECT is_exercises FROM sections WHERE id=?", (sid,))["is_exercises"]:
             continue
+        if db.q1("SELECT 1 FROM blocks WHERE section_id=? AND transcription_method='none' LIMIT 1", (sid,)):
+            continue  # being read again right now (a re-run); its own optimize job sees the new context
+
         optimize_and_verify(sid, profile, should_stop)  # processing_parallel is off: full book-wide context
         verify_and_finalize(sid, profile, should_stop)
         redone.append(sid)

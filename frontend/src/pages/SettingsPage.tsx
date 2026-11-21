@@ -95,6 +95,27 @@ export function SettingsPage() {
                   ))}
                 </select>
               </label>
+              <hr className="divider" />
+              <label className="field">
+                Automatic diagrams while a book is processed
+                <select
+                  value={routing.auto_diagrams}
+                  onChange={(e) => apply({ auto_diagrams: e.target.value }, "automatic diagrams")}
+                >
+                  <option value="off">Off</option>
+                  {premium.map((m) => (
+                    <option key={m.id} value={m.id} disabled={!m.available}>
+                      {m.label}
+                      {m.available ? "" : " (not available)"}
+                    </option>
+                  ))}
+                </select>
+                <span className="muted small">
+                  Where the optimizer finds a picture would really help (at most 2 per section), this model draws an
+                  interactive diagram in parallel with processing; a second model reviews it. Diagrams are saved and
+                  shown in the text. The passage is sent to that model's vendor.
+                </span>
+              </label>
             </>
           )}
         </div>

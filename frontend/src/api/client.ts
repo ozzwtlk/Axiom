@@ -1,6 +1,7 @@
 import type {
-  AnswerCheck, AskRequest, AskResponse, DocumentDetail, ExerciseMapItem, Quiz, QuizResult, Solution, Visualization, DocumentSummary, Exercise, HintResponse,
+  AnswerCheck, AskRequest, AskResponse, DocumentDetail, ExerciseMapItem, Quiz, QuizResult, Solution, Visualization, Xrefs, DocumentSummary, Exercise, HintResponse,
   ProcessRequest, ProcessResponse, ProgressReport, SearchHit, SectionView, SourceBlock, ModelsReport, Routing, TaskGroup, MachinesReport, PendingImport,
+  QualityReport,
 } from "./types";
 import * as M from "../mocks/sampleSection";
 
@@ -72,6 +73,19 @@ export function getDocument(docId: string): Promise<DocumentDetail> {
 export function processDocument(docId: string, body: ProcessRequest): Promise<ProcessResponse> {
   if (MOCK) return delay({ job_ids: body.chapters.map((c) => `mock-job-${c}`) });
   return request(`/documents/${enc(docId)}/process`, json(body));
+}
+
+export function getQuality(docId: string): Promise<QualityReport> {
+  return request(`/documents/${enc(docId)}/quality`);
+}
+
+/** Check all processed sections (no model); `rerun` also queues what still needs a model. */
+export function runQuality(docId: string, body: { rerun: boolean; profile?: string; model?: string }): Promise<{ job_ids: string[] }> {
+  return request(`/documents/${enc(docId)}/quality`, json(body));
+}
+
+export function restructureDocument(docId: string, force = false): Promise<{ chapters: number; changed: boolean }> {
+  return request(`/documents/${enc(docId)}/restructure${force ? "?force=true" : ""}`, json({}));
 }
 
 export function getProgress(docId: string): Promise<ProgressReport> {
@@ -165,6 +179,10 @@ export function pushToAnki(docId: string, deck: string, chapters?: number[]): Pr
 }
 
 // ---------------------------------------------------------------- visualizations
+export function getXrefs(docId: string): Promise<Xrefs> {
+  return request(`/documents/${enc(docId)}/xrefs`);
+}
+
 export function getVisualization(unitId: string): Promise<Visualization> {
   return request(`/units/${enc(unitId)}/visualization`);
 }
@@ -210,7 +228,7 @@ export function getRouting(): Promise<Routing> {
   return request("/settings/routing");
 }
 
-export function saveRouting(update: { groups?: Partial<Record<TaskGroup, string>>; premium_default?: string; cloud_enabled?: boolean }): Promise<Routing> {
+export function saveRouting(update: { groups?: Partial<Record<TaskGroup, string>>; premium_default?: string; cloud_enabled?: boolean; auto_diagrams?: string }): Promise<Routing> {
   return request("/settings/routing", { method: "PUT", headers: { "content-type": "application/json" },
     body: JSON.stringify({ groups: {}, ...update }) });
 }

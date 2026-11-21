@@ -350,3 +350,53 @@ def test_equations_copied_into_prose_are_interleaved_in_source_order():
     assert out[0]["text_md"] == "The force is:" and "$$" not in out[2]["text_md"]
     assert out[0]["fast_md"] and out[2]["fast_md"] is None and out[2]["min_level"] == 2  # no duplicate in Fast Track
     assert out[1]["_pos"] < out[2]["_pos"] < out[3]["_pos"]
+
+
+def _lecture_notes(path):
+    """Born-digital notes: unnumbered outline titles, numbers printed in the text, two sections on one page."""
+    import pymupdf
+    d = pymupdf.open()
+    body = ("This paragraph explains the idea in plain words and keeps going for a while so that it is "
+            "recognised as ordinary body text by the layout analysis of the extractor.")
+    p1 = d.new_page()
+    h = p1.rect.height
+    p1.insert_text((72, 60), "Contents", fontsize=16)
+    p2 = d.new_page()
+    p2.insert_text((72, 80), "1 Thermal States", fontsize=16)
+    p2.insert_textbox((72, 100, 520, 200), "CHAPTERINTRO " + body, fontsize=10)
+    p2.insert_text((72, 260), "1.1 Density Matrices", fontsize=13)
+    p2.insert_textbox((72, 275, 520, 380), "FIRSTSEC " + body, fontsize=10)
+    p2.insert_text((72, 440), "1.2 Partition Functions", fontsize=13)
+    p2.insert_textbox((72, 455, 520, 560), "SECONDSEC " + body, fontsize=10)
+    p3 = d.new_page()
+    p3.insert_text((72, 80), "2 Black Holes", fontsize=16)
+    p3.insert_textbox((72, 100, 520, 200), "CHAPTERTWO " + body, fontsize=10)
+    d.set_toc([[1, "Contents", 1], [1, "Thermal States", 2, {"kind": pymupdf.LINK_GOTO, "to": pymupdf.Point(72, h - 62)}],
+               [2, "Density Matrices", 2, {"kind": pymupdf.LINK_GOTO, "to": pymupdf.Point(72, h - 240)}],
+               [2, "Partition Functions", 2, {"kind": pymupdf.LINK_GOTO, "to": pymupdf.Point(72, h - 420)}],
+               [1, "Black Holes", 3, {"kind": pymupdf.LINK_GOTO, "to": pymupdf.Point(72, h - 62)}]])
+    d.save(path)
+
+
+def test_lecture_notes_outline_gives_chapters_and_positional_sections(tmp_db, tmp_path):
+    from axiom.extraction.extract import extract_chapter
+    from axiom.ingestion.pdf import import_pdf, restructure
+    pdf = tmp_path / "notes.pdf"
+    _lecture_notes(pdf)
+    doc = import_pdf(pdf)
+    secs = [(r["number"], r["title"], r["start_y"] is not None)
+            for r in db.q("SELECT * FROM sections WHERE doc_id=? ORDER BY chapter_id, ord", (doc,))]
+    assert [s[:2] for s in secs] == [("1.0", "Thermal States"), ("1.1", "Density Matrices"),
+                                     ("1.2", "Partition Functions"), ("2.0", "Black Holes")]
+    assert all(s[2] for s in secs)  # "Contents" is skipped; every section knows where it starts
+    extract_chapter(doc, f"{doc}-c1")
+    text = {r["number"]: " ".join(x["raw_text"] for x in db.q("SELECT raw_text FROM blocks WHERE section_id=?", (r["id"],)))
+            for r in db.q("SELECT id, number FROM sections WHERE chapter_id=?", (f"{doc}-c1",))}
+    assert "CHAPTERINTRO" in text["1.0"] and "FIRSTSEC" not in text["1.0"]
+    assert "FIRSTSEC" in text["1.1"] and "SECONDSEC" not in text["1.1"]  # split mid-page
+    assert "SECONDSEC" in text["1.2"]
+    # documents imported with the old parser can be re-read; refused once something was extracted
+    with pytest.raises(RuntimeError):
+        restructure(doc)
+    assert restructure(doc, force=True)["sections"] == 4
+    assert not db.q1("SELECT 1 FROM blocks WHERE doc_id=?", (doc,))

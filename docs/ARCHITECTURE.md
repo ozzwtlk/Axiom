@@ -36,13 +36,26 @@ extract     OCR/text layer → lines with bbox+font size → semantic blocks    
             into a neighbouring block
 transcribe  math-bearing blocks: crop image + OCR hint → vision LLM → Markdown/LaTeX  (local VLM)
             on scanned books every paragraph too (OCR mangles Greek letters inside prose)
+            LaTeX that KaTeX rejects → one retry told the error, then deterministic syntax repair
+            + quality control (blocks): page numbers → artifact, text cut out as images → text, lines
+              caught twice → removed                                              (deterministic)
 optimize    windows of consecutive blocks (never split equation from its paragraph)  (local LLM)
             → units: role, min_level, fast/standard/deep text, coverage mapping
+              standard = teaching text (bold key terms/claims, steps, cited equations);
+              deep = AI derivation steps ($$…$$, never numbered), meaning, limits, links;
+              notes = ≤3 study notes (key/intuition/pitfall/recall/check); diagram = optional idea
             + coverage audit (every block mapped), equation integrity, KaTeX parse    (deterministic)
+            → ≤2 "diagram" jobs per section on the model in Settings (default Codex), own thread,
+              in parallel with the pipeline; a skipped/rejected diagram never fails the section
 verify      independent faithfulness check of every AI-written unit against its     (local LLM, reasoning;
             source blocks; contradicted text → reverted to the original, contradicted   premium if profile allows)
-            fast/deep version → dropped, dropped conditions / unsupported claims → flagged.
-            Then a short reader digest of the section and a final coverage audit.
+            fast/deep version, study notes, equation annotation → dropped (AI-added equation steps are
+            checked step by step), dropped conditions / unsupported claims → flagged.
+            Then a short reader digest of the section, the cross-reference check (references without a
+            target are logged in the stats) and a final coverage audit.
+quality     after optimize and verify (verification/quality.py): LaTeX repair / drop / revert, stray
+            LaTeX wrapped, repeats and cut-off texts removed; open issues (verbatim passages, broken
+            transcriptions, unchecked batches, coverage) keep the section 'partial'      (deterministic)
 ```
 
 Job graph per chapter: `extract → transcribe(s_i) → optimize(s_i) → verify(s_i)`; `optimize(s_i)` also waits
@@ -56,7 +69,7 @@ for `optimize(s_{i-1})` (its summary is context). A section is readable after `o
 | Answer checking | student's scratchpad vs reference solution(s); first error pointed out, no full solution; warns when references disagree |
 | Mastery checks / chapter exams | questions only from units that passed the faithfulness check, each citing its source units; every multiple-choice question is answered blind (key hidden) and dropped if the blind answer differs; MCQ graded deterministically, short answers by rubric |
 | Exercise-first mode | deterministic exercise→section map (shared concepts, cited equation numbers); practice page + "try first" box in the reader |
-| Visualizations | model writes plain HTML/JS; static screen (no network/storage/parent access/eval/external URLs); served by the server inside its own document with `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; connect-src 'none' …`; embedded in `<iframe sandbox="allow-scripts">` without `allow-same-origin` |
+| Visualizations | saved in `visualizations`, anchored to source blocks (`anchor_blocks`) so re-optimizing moves them to the unit that now shows the passage (none fits → kept as `detached:<section>:…`, re-attached later); shown automatically in the reader; "save as file" download. Model writes plain HTML/JS; static screen (no network/storage/parent access/eval/external URLs); served by the server inside its own document with `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; connect-src 'none' …`; embedded in `<iframe sandbox="allow-scripts">` without `allow-same-origin` |
 | Anki | deterministic cards from verified units (flagged units skipped); `.apkg` (genanki, note type "AXIOM Basic", stable GUIDs), `.txt` import file, or AnkiConnect push to the local Anki (updates notes by `AxiomID`). Files are kept in `data/exports/` |
 
 ### Mathematical integrity rules (enforced in code, not prompts)
@@ -113,7 +126,10 @@ All JSON. Base `/api`.
 | POST | `/quizzes/{quiz_id}/grade` body `{answers: {q1: 0, q2: "text"}}` | per-question score, key, explanation, sources |
 | GET | `/documents/{doc_id}/mastery` | `{section_id: best score}` |
 | GET / POST | `/units/{unit_id}/visualization` | metadata / generate (`?regenerate=true`) |
-| GET | `/units/{unit_id}/visualization.html` | the sandboxed page (CSP `sandbox allow-scripts`, no network) |
+| GET | `/units/{unit_id}/visualization.html[?download=1]` | the sandboxed page (CSP `sandbox allow-scripts`, no network); `download` = attachment |
+| GET | `/documents/{doc_id}/quality` | quality control report: fixes per kind, open issues per section (what still needs a model) |
+| POST | `/documents/{doc_id}/quality` | `{rerun, profile, model}`: "quality" job per processed section (deterministic fixes); `rerun` re-queues transcribe → optimize → verify for sections with open issues |
+| GET | `/documents/{doc_id}/xrefs` | cross-reference index from source blocks: equations, figures, sections, chapters → block/section ids; `unresolved` references |
 
 TypeScript shapes: see `frontend/src/api/types.ts` (mirrors `backend/axiom/api/schemas.py`).
 

@@ -115,7 +115,9 @@ def document(viz: dict) -> str:
             f"<title>{html.escape(viz['title'])}</title></head><body>{viz['html']}</body></html>")
 
 
-def visualize(unit_id: str, profile: str = "balanced", regenerate: bool = False, model: str | None = None) -> dict:
+def visualize(unit_id: str, profile: str = "balanced", regenerate: bool = False, model: str | None = None,
+              idea: str | None = None) -> dict:
+    """`idea`: the optimizer's one-sentence suggestion of what to draw (automatic diagrams during processing)."""
     row = db.q1("SELECT data FROM visualizations WHERE unit_id=?", (unit_id,))
     if row and not regenerate:
         return json.loads(row["data"])
@@ -131,6 +133,8 @@ def visualize(unit_id: str, profile: str = "balanced", regenerate: bool = False,
         "SELECT data FROM units WHERE section_id=(SELECT section_id FROM units WHERE id=?) AND ord BETWEEN"
         " (SELECT ord FROM units WHERE id=?)-2 AND (SELECT ord FROM units WHERE id=?)+1 ORDER BY ord", (unit_id,) * 3)]
     user = PROMPT + f"§{u['number']} {u['title']}\n{passage}\n\nSurrounding text (context):\n" + "\n".join(ctx)[:3000]
+    if idea:  # written by our optimizer from the same passage, so it is data too
+        user += "\n\nSuggested diagram (a starting point; correctness against the passage comes first):\n" + idea
 
     def validate(v):
         bad = screen(v["html"])
@@ -154,7 +158,9 @@ def visualize(unit_id: str, profile: str = "balanced", regenerate: bool = False,
                                                                                  route.fallback, "independent review")
     v, meta = llm.call_json("visualize", route, req, VIZ_VERSION, validate, doc_id=u["doc_id"], profile=profile,
                             attempts=3)
-    out = dict(v, unit_id=unit_id, model=meta["model"], ai_generated=True)
+    # anchored to the source blocks so it follows its passage when the section is re-optimized
+    out = dict(v, unit_id=unit_id, model=meta["model"], ai_generated=True, anchor_blocks=sorted(d.get("block_ids", [])),
+               automatic=bool(idea))
     with db.connect() as c:
         c.execute("INSERT OR REPLACE INTO visualizations(unit_id, doc_id, data, created_at) VALUES (?,?,?,?)",
                   (unit_id, u["doc_id"], db.jdump(out), datetime.now(timezone.utc).isoformat()))

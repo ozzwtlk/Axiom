@@ -21,8 +21,10 @@ function u(p: Partial<Unit> & Pick<Unit, "id" | "kind" | "text_md">): Unit {
     flags: [],
     figure_url: null,
     verification: null,
+    notes: [],
+    has_visualization: false,
     ...p,
-  };
+  } as Unit;
 }
 
 export const sampleSection: SectionView = {

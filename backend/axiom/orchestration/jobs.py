@@ -66,6 +66,8 @@ def enqueue_document(doc_id: str, chapter_numbers: list[int], profile: str = "ec
             ex = _extract_job(c, doc_id, ch, profile, model, parallel)
             ids.append(ex)
             for s in c.execute("SELECT * FROM sections WHERE chapter_id=? ORDER BY ord", (ch["id"],)).fetchall():
+                if s["status"] in ("partial", "failed"):
+                    _forget_section_jobs(c, s["id"])  # finished jobs would make this a no-op: run it again
                 tr = _add(c, doc_id, "transcribe", s["id"], [ex], profile, model, parallel)
                 op = _add(c, doc_id, "optimize", s["id"], [tr] + (["~" + prev_opt] if prev_opt else []), profile, model, parallel)
                 vf = _add(c, doc_id, "verify", s["id"], [op], profile, model, parallel)
@@ -79,6 +81,56 @@ def enqueue_document(doc_id: str, chapter_numbers: list[int], profile: str = "ec
             nums = ",".join(str(n) for n in sorted(chapter_numbers))
             ids.append(_add(c, doc_id, "reconcile", f"{doc_id}@{nums}", soft, profile, model, False))
     return ids
+
+
+def _forget_section_jobs(c, section_id: str) -> None:
+    """Make the next run of a section real: drop its finished/failed stage jobs and mark the transcriptions the
+    quality check found broken as unread. Everything that was fine comes back from the cache."""
+    from axiom.verification.quality import blocks_to_reread
+    c.execute("DELETE FROM jobs WHERE target_id=? AND kind IN ('transcribe','optimize','verify') AND status!='running'",
+              (section_id,))
+    bad = blocks_to_reread(section_id)
+    if bad:
+        c.execute(f"UPDATE blocks SET transcription_method='none', transcribed_md=NULL WHERE id IN ({','.join('?' * len(bad))})"
+                  " AND section_id=?", (*bad, section_id))
+    c.execute("DELETE FROM meta WHERE key=?", (f"empty:{section_id}",))
+
+
+def requeue_section(section_id: str, profile: str = "economy", model: str | None = None) -> list[str]:
+    """transcribe → optimize → verify again for one section (what the quality check could not fix itself)."""
+    sec = db.q1("SELECT doc_id FROM sections WHERE id=?", (section_id,))
+    with db.connect() as c:
+        if c.execute("SELECT 1 FROM jobs WHERE target_id=? AND status='running' AND kind IN ('transcribe','optimize',"
+                     "'verify')", (section_id,)).fetchone():
+            return []
+        _forget_section_jobs(c, section_id)
+        tr = _add(c, sec["doc_id"], "transcribe", section_id, [], profile, model)
+        op = _add(c, sec["doc_id"], "optimize", section_id, [tr], profile, model)
+        return [tr, op, _add(c, sec["doc_id"], "verify", section_id, [op], profile, model)]
+
+
+def enqueue_quality(doc_id: str, rerun: bool, profile: str = "economy", model: str | None = None) -> list[str]:
+    """Check every processed section of a document (no model). With `rerun`, sections that still need a model
+    (verbatim passages, broken transcriptions, unchecked batches) are queued again — only those parts cost calls."""
+    ids = []
+    with db.connect() as c:
+        for s in c.execute("SELECT id FROM sections WHERE doc_id=? AND status IN ('done','partial','failed') ORDER BY ord",
+                           (doc_id,)).fetchall():
+            c.execute("DELETE FROM jobs WHERE kind='quality' AND target_id LIKE ? AND status!='running'", (s["id"] + "|%",))
+            ids.append(_add(c, doc_id, "quality", f"{s['id']}|{'rerun' if rerun else 'check'}", [], profile, model))
+    return ids
+
+
+def _run_quality(job: dict) -> dict:
+    from axiom.verification import quality
+    section_id, _, mode = job["target_id"].partition("|")
+    sec = db.q1("SELECT status FROM sections WHERE id=?", (section_id,))
+    if not sec:
+        return {"skipped": "section no longer exists"}
+    r = quality.check_section(section_id) if sec["status"] != "failed" else {"fixed": {}, "needs": ["optimize"]}
+    if mode == "rerun" and r.get("needs"):
+        r["requeued"] = requeue_section(section_id, job["profile"], job["model"])
+    return r
 
 
 def _extract_job(c, doc_id: str, ch, profile: str, model: str | None, parallel: bool) -> str:
@@ -146,7 +198,52 @@ def recover() -> int:
 
 
 _GROUP_OF_KIND = {"transcribe": "transcribe", "optimize": "optimize", "verify": "faithfulness",
-                  "reconcile": "optimize"}
+                  "reconcile": "optimize", "diagram": "visualize"}
+
+MAX_DIAGRAMS_PER_SECTION = 2
+
+
+def enqueue_diagrams(section_id: str, profile: str = "balanced") -> list[str]:
+    """After a section is optimized: the units the optimizer marked as worth a picture get a diagram job each,
+    on the model chosen in Settings (default Codex). They run on their own thread, alongside the rest of the run,
+    and never hold up or fail the section. The target is the unit's source blocks (stable across re-optimizing)."""
+    from axiom.orchestration import models
+    mid = models.load_routing()["auto_diagrams"]
+    if mid == "off" or not models.available(mid):
+        return []
+    sec = db.q1("SELECT doc_id FROM sections WHERE id=?", (section_id,))
+    have = {r["unit_id"] for r in db.q("SELECT unit_id FROM visualizations WHERE unit_id LIKE ?", (section_id + "-u%",))}
+    ids: list[str] = []
+    with db.connect() as c:
+        for r in c.execute("SELECT id, data FROM units WHERE section_id=? ORDER BY ord", (section_id,)).fetchall():
+            if len(ids) >= MAX_DIAGRAMS_PER_SECTION:
+                break
+            u = json.loads(r["data"])
+            if u.get("diagram_idea") and r["id"] not in have:
+                ids.append(_add(c, sec["doc_id"], "diagram", f"{section_id}|{','.join(u['block_ids'])}", [], profile, mid))
+    return ids
+
+
+def _run_diagram(job: dict) -> dict:
+    from axiom.model_adapters.base import AdapterUnavailable
+    from axiom.orchestration.llm import BudgetExceeded, ValidationFailed
+    from axiom.visualization.generate import visualize
+    section_id, _, blocks = job["target_id"].partition("|")
+    want = set(blocks.split(","))
+    unit = None
+    for r in db.q("SELECT id, data FROM units WHERE section_id=? ORDER BY ord", (section_id,)):
+        u = json.loads(r["data"])
+        if set(u.get("block_ids", [])) == want:
+            unit = dict(u, id=r["id"])
+            break
+    if not unit or not unit.get("diagram_idea"):
+        return {"skipped": "the passage changed since the diagram was suggested"}
+    try:
+        v = visualize(unit["id"], job["profile"], model=job["model"], idea=unit["diagram_idea"])
+    except (ValidationFailed, AdapterUnavailable, BudgetExceeded) as e:  # an optional extra: never fail the run
+        log.info("automatic diagram for %s skipped: %s", unit["id"], e)
+        return {"skipped": str(e)[:300]}
+    return {"unit_id": unit["id"], "title": v.get("title"), "model": v.get("model")}
 
 
 def can_run(job, selected: str = "auto") -> bool:
@@ -235,6 +332,10 @@ def _run_kind(job: dict, kind: str, target: str, profile: str, should_stop) -> N
     elif kind == "verify":
         from axiom.orchestration.pipeline import verify_and_finalize
         result = verify_and_finalize(target, profile, should_stop)
+    elif kind == "diagram":
+        result = _run_diagram(job)
+    elif kind == "quality":
+        result = _run_quality(job)
     else:
         raise ValueError(f"unknown job kind {kind}")
     with db.connect() as c:
@@ -264,7 +365,7 @@ def _worker(kinds: tuple[str, ...], idle_exit: bool, parallel_only: bool = False
                 st = "failed" if row["attempts"] >= row["max_attempts"] else "pending"
                 c.execute("UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
                           (st, f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}", _now(), job["id"]))
-                if st == "failed" and job["kind"] != "extract":
+                if st == "failed" and job["kind"] not in ("extract", "diagram", "quality"):
                     c.execute("UPDATE sections SET status='failed' WHERE id=?", (job["target_id"],))
 
 
@@ -284,7 +385,10 @@ def start_workers(n_transcribe: int = 1, n_optimize: int | None = None, idle_exi
             t = threading.Thread(target=_worker, args=(kinds, idle_exit, True), daemon=True)
             t.start()
             threads.append(t)
-    for kinds, n in ((("import", "extract", "reextract", "transcribe"), n_transcribe), (("optimize", "verify", "extract", "reextract", "reconcile"), n_optimize)):
+    # diagrams (a subscription model, not the GPU) run on their own thread, in parallel with the pipeline
+    for kinds, n in ((("import", "extract", "reextract", "transcribe", "quality"), n_transcribe),
+                     (("optimize", "verify", "extract", "reextract", "reconcile", "quality"), n_optimize),
+                     (("diagram",), 1)):
         for _ in range(n):
             t = threading.Thread(target=_worker, args=(kinds, idle_exit), daemon=True)
             t.start()

@@ -60,6 +60,11 @@ class UnitSource(BaseModel):
     note: str | None = None
 
 
+class StudyNote(BaseModel):
+    kind: Literal["key", "intuition", "pitfall", "recall", "check"]
+    md: str  # AI-written, always labelled as such
+
+
 class Unit(BaseModel):
     id: str
     kind: UnitKind
@@ -78,6 +83,8 @@ class Unit(BaseModel):
     figure_url: str | None = None
     # independent faithfulness check: verified | flagged | reverted | unchecked; None = not applicable / not run yet
     verification: Literal["verified", "flagged", "reverted", "unchecked"] | None = None
+    notes: list[StudyNote] = Field(default_factory=list)  # AI study notes (Standard + Deep Dive)
+    has_visualization: bool = False  # a saved visualization exists for this unit
 
 
 class ExerciseSummary(BaseModel):

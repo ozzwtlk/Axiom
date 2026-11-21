@@ -146,6 +146,10 @@ def extract_chapter(doc_id: str, chapter_id: str, force: bool = False) -> int:
             hs = frozenset(r["content_hash"] for r in db.q("SELECT content_hash FROM blocks WHERE section_id=?", (s["id"],)))
             before[s["id"]] = (hs, s["stage"], s["status"])
     by_number = {s["number"]: s for s in sections}
+    # born-digital notes: the outline anchors say exactly where each section starts, so text is split by position
+    # (headings in such notes have no fixed style to detect). Scans (no anchors) switch at a detected heading.
+    anchors = [((s["page_start"], s["start_y"] or 0.0), s) for s in sections]
+    positional = any(s["start_y"] is not None for s in sections)
     pdf = open_pdf(doc_id)
     current = sections[0]
     assigned: list[tuple[str, PageBlock, bool]] = []
@@ -167,7 +171,10 @@ def extract_chapter(doc_id: str, chapter_id: str, force: bool = False) -> int:
                 b.bbox = fit_to_ink(page, b.bbox, upper, lower)
         first_text_seen = False
         for b in pblocks:
-            if b.kind == "heading" and b.heading_number in by_number:
+            if positional:
+                at = (pno, b.bbox[1] + 2)
+                current = next((s for key, s in reversed(anchors) if key <= at), sections[0])
+            elif b.kind == "heading" and b.heading_number in by_number:
                 current = by_number[b.heading_number]
             if "empty_gap_visual" in b.flags and ink_fraction(page, b.bbox) < 0.004:
                 continue  # blank band, nothing to transcribe
