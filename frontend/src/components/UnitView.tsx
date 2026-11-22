@@ -1,5 +1,5 @@
 import { memo, useState } from "react";
-import type { Flag, Level, Unit, UnitKind } from "../api/types";
+import type { Flag, Level, NoteKind, StudyNote, Unit, UnitKind } from "../api/types";
 import { Equation, Md, MdInline } from "./Md";
 import { SourcePanel } from "./SourcePanel";
 import { VizPanel } from "./VizPanel";
@@ -27,6 +27,32 @@ const FLAG_LABEL: Record<Flag["kind"], string> = {
   unverified_claim: "unconfirmed claim",
   reverted: "reverted to original",
 };
+
+const NOTE_META: Record<NoteKind, { label: string; icon: string }> = {
+  key: { label: "Key idea", icon: "★" },
+  intuition: { label: "Intuition", icon: "◐" },
+  pitfall: { label: "Watch out", icon: "!" },
+  recall: { label: "Recall", icon: "↺" },
+  check: { label: "Check", icon: "✓" },
+};
+
+function StudyNotes({ notes }: { notes: StudyNote[] }) {
+  return (
+    <aside className="study-notes" aria-label="Study notes (AI-written)">
+      {notes.map((n, i) => (
+        <div key={i} className={`study-note note-${n.kind}`}>
+          <span className="note-label">
+            <span aria-hidden="true">{NOTE_META[n.kind].icon}</span> {NOTE_META[n.kind].label}
+          </span>
+          <Md src={n.md} />
+        </div>
+      ))}
+      <span className="ai-tag" title="Study notes written by the AI, not from the book; checked against the source">
+        AI notes
+      </span>
+    </aside>
+  );
+}
 
 const VIZ_KINDS = new Set<UnitKind>(["equation", "definition", "result", "theorem", "example", "prose"]);
 
@@ -56,7 +82,8 @@ interface Props {
 
 function UnitViewImpl({ unit, level, sectionId }: Props) {
   const [showSource, setShowSource] = useState(false);
-  const [showViz, setShowViz] = useState(false);
+  // a saved visualization is part of the text: shown without asking again
+  const [showViz, setShowViz] = useState(unit.has_visualization);
   const meta = KIND_META[unit.kind];
   const body = level === 1 ? (unit.fast_md ?? unit.text_md) : unit.text_md;
   const deep = level === 3 ? unit.deep_md : null;
@@ -156,6 +183,8 @@ function UnitViewImpl({ unit, level, sectionId }: Props) {
     >
       {content}
 
+      {level >= 2 && unit.notes?.length > 0 && <StudyNotes notes={unit.notes} />}
+
       {deep && (
         <div className="deep-box">
           <div className="deep-label">
@@ -196,7 +225,7 @@ function UnitViewImpl({ unit, level, sectionId }: Props) {
               ✓ checked
             </span>
           )}
-          {VIZ_KINDS.has(unit.kind) && level >= 2 && (
+          {(unit.has_visualization || (VIZ_KINDS.has(unit.kind) && level >= 2)) && (
             <button type="button" className="link-btn viz-btn" onClick={() => setShowViz((v) => !v)} aria-expanded={showViz}>
               <Icon name="chart" /> {showViz ? "Hide visualization" : "Visualize"}
             </button>

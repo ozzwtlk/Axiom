@@ -59,6 +59,44 @@ frontend `pnpm test` → 15 passed; `pnpm e2e` → 14/14 against the live server
 4. The first generated boost diagram drew the x′ axis with the wrong sign; the independent visualization review
    (added for this) catches exactly that error.
 
+## Changes 2026-11-21: quality control
+
+`verification/quality.py`, deterministic, runs after transcription, optimize and verify (and on demand):
+- Block level: page numbers ("- 4 -") → `artifact` blocks (coverage `omitted` with reason); figure regions that
+  are really text (captions, theorem boxes, stray lines) → caption/paragraph, read again; a line caught twice
+  (equation crop including the next line, paragraph repeated in the next block) → copy removed.
+- Unit level: KaTeX-failing LaTeX repaired (`\eqno`, upgreek, `\slashed`, letter-spaced words in `\mathrm`,
+  unbalanced braces), else optional AI field dropped / AI rewrite reverted / transcription queued to be read again;
+  LaTeX written outside math wrapped (only if it renders); repeated sentences and loops removed; texts the model
+  stopped mid-sentence cut to the last sentence (optional fields) or reverted (main text); a unit repeating its
+  neighbour merged into it.
+- Open issues (verbatim passages after a failed rewrite, broken transcriptions, unchecked batches, coverage) keep a
+  section `partial`; everything else makes it `done`. Report: `GET /api/documents/{id}/quality`.
+- Re-processing a partial/failed chapter now really re-runs its sections (finished jobs used to make it a no-op);
+  only broken transcriptions are read again and successful windows come from the cache. "Quality check" panel on
+  the book page: "Check again" (no model) and "Fix with the model" (re-runs only sections that need it).
+- Transcription retries once with the KaTeX error when its LaTeX does not render. Empty `n.0` chapter openings
+  are skipped instead of failing the chapter. Dashed page numbers are recognised as folios during extraction.
+- Dry run on 3,800 units of the processed books: 77 repeats, 76 LaTeX repairs, 61 cut-off texts.
+
+## Changes 2026-11-20 (second round)
+
+1. **Upload 500 on the Pi server fixed.** `POST /api/documents` was `async` and wrote SQLite on the event loop;
+   while a worker held a server-side transaction (its job poll, every second) the loop froze, the worker's commit
+   could not be served, and the upload died after the 30 s lock timeout. Blocking work now runs in a thread
+   (regression test `test_upload_while_a_worker_holds_a_transaction`). Needs `./axiom ship-server` to reach the Pi.
+2. **Teaching text** (`optimize-v3`, `faithful-v3`): Standard level emphasises key terms and claims and explains
+   step by step; Deep Dive adds derivation steps, meaning, limiting cases; up to 3 study notes per unit. All AI
+   additions are checked (contradicted → dropped). Re-processing a book re-runs optimize + verify (cache miss).
+3. **Visualizations persist** across re-optimization (anchored to blocks) and show without another click.
+4. **Cross-references** "(2.13)", "Figure 1.5", "Section 2.4", "Chapter 3" are links with hover previews.
+5. **Automatic diagrams** during processing (Settings → Cloud models; default Codex, reviewed by Claude).
+6. **Lecture notes get real chapters.** Outlines without "CHAPTER n" titles (Witten, Laine–Vuorinen, Deffner–
+   Campbell) now give one chapter per level-1 entry, numbered as printed; front matter becomes chapter 0. Sections
+   start at their outline anchor (checked against the printed title), and extraction splits text by position, so
+   unstyled headings no longer matter. Already-imported documents: "re-read outline" on the document page
+   (or `axiom restructure <doc_id>`), allowed until something has been extracted.
+
 ## Known problems (honest list)
 
 1. **Faithfulness on the local model is good, not perfect.** It still flags some correct additions as “not in the

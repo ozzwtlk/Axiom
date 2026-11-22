@@ -1,21 +1,15 @@
-"""Anki export (deterministic v1): cards from verified units, no model calls.
-
-Card sources (only units at Fast-Track level 1 or titled definitions/results, to avoid card spam):
-  * definition / theorem / result units with a title → "Define/State: <title>" → text (+ its equation)
-  * a prose lead-in immediately followed by a numbered equation → lead-in → verbatim equation
-Math is converted to Anki's MathJax delimiters \\( \\) and \\[ \\].
-Each note has a stable GUID derived from its source block ids, so re-importing updates existing notes
-(Anki matches on GUID) instead of creating duplicates. Anki's importer asks before updating; nothing is
-overwritten silently.
-"""
+"""Export reviewed study decks with MathJax and original figure crops."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
-import json
 import re
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from axiom.anki.study import build_cards as build_cards
 from axiom.storage import db
 
 
@@ -28,53 +22,43 @@ def to_anki_math(md: str) -> str:
     return s.replace("\n", "<br>").replace("\t", " ")
 
 
-def _guid(kind: str, block_ids: list[str]) -> str:
-    return "axiom-" + hashlib.sha1((kind + "|" + ",".join(block_ids)).encode()).hexdigest()[:16]
+def _with_media(cards: list[dict]) -> tuple[list[dict], dict[str, bytes]]:
+    from axiom.extraction.extract import crop_png, open_pdf
+    from contextlib import ExitStack
 
-
-def build_cards(doc_id: str, chapters: list[int] | None = None) -> list[dict]:
-    doc = db.q1("SELECT title FROM documents WHERE id=?", (doc_id,))
-    q = ("SELECT s.id, s.number, s.title, c.number AS ch FROM sections s JOIN chapters c ON c.id=s.chapter_id"
-         " WHERE s.doc_id=? AND s.stage='verified' ORDER BY c.number, s.ord")
-    cards: list[dict] = []
-    for sec in db.q(q, (doc_id,)):
-        if chapters and sec["ch"] not in chapters:
-            continue
-        units = [json.loads(r["data"]) for r in db.q("SELECT data FROM units WHERE section_id=? ORDER BY ord", (sec["id"],))]
-        tags = [f"axiom::ch{sec['ch']}", f"axiom::sec{sec['number'].replace('.', '_')}"]
-        cite = f"{doc['title']} §{sec['number']} {sec['title']}"
-        for i, u in enumerate(units):
-            if (u.get("verification") or {}).get("status") == "flagged":
-                continue  # an independent check could not confirm it: not flashcard material
-            nxt = units[i + 1] if i + 1 < len(units) else None
-            eq_after = nxt if (nxt and nxt["kind"] == "equation" and nxt.get("latex")) else None
-            pages = u.get("pages") or []
-            src = f"{cite}, p.{pages[0]}" if pages else cite
-            if u["kind"] in ("definition", "theorem", "result") and u.get("title"):
-                verb = "Define" if u["kind"] == "definition" else "State"
-                back = u.get("fast_md") or u["text_md"]
-                if eq_after:
-                    back += f"\n$${eq_after['latex']}$$" + (f" ({eq_after['eq_number']})" if eq_after.get("eq_number") else "")
-                cards.append({"guid": _guid("def", u["block_ids"]), "front": f"{verb}: {u['title']}", "back": back,
-                              "source": src, "tags": tags + [f"axiom::{u['kind']}"], "level": u["min_level"]})
-            elif (eq_after and eq_after.get("eq_number") and u["kind"] != "heading" and u["min_level"] <= 2
-                  and (u["text_md"] or "").rstrip().endswith(":")):
-                cards.append({"guid": _guid("eq", eq_after["block_ids"]),
-                              "front": (u.get("fast_md") or u["text_md"]).strip() + " (complete the equation)",
-                              "back": f"$${eq_after['latex']}$$ ({eq_after['eq_number']})"
-                                      + (f"\n{eq_after['annotation_md']}" if eq_after.get("annotation_md") else ""),
-                              "source": src, "tags": tags + ["axiom::equation"], "level": min(u["min_level"], eq_after["min_level"])})
-    seen, out = set(), []
-    for c in cards:
-        if c["guid"] not in seen:
-            seen.add(c["guid"])
-            out.append(c)
-    return out
+    out, media, names, pdfs = [], {}, {}, {}
+    with ExitStack() as stack:
+        for card in cards:
+            bid = card.get("figure")
+            if not bid:
+                out.append(card)
+                continue
+            if bid not in names:
+                names[bid] = None
+                row = db.q1("SELECT * FROM blocks WHERE id=? AND block_type='figure'", (bid,))
+                if row:
+                    doc_id = row["doc_id"]
+                    if doc_id not in pdfs:
+                        pdfs[doc_id] = stack.enter_context(open_pdf(doc_id))
+                    try:
+                        png = crop_png(doc_id, row["page"], [row[k] for k in ("x0", "y0", "x1", "y1")],
+                                       dpi=130, pdf=pdfs[doc_id])
+                    except ValueError:  # stale or degenerate crop; don't export an unanswerable card
+                        continue
+                    name = f"axiom-{hashlib.sha256(png).hexdigest()[:24]}.png"
+                    media[name] = png
+                    names[bid] = name
+            if names[bid]:
+                out.append(dict(card, media_name=names[bid]))
+    return out, media
 
 
 def to_tsv(cards: list[dict], deck: str) -> str:
+    deck = " ".join(deck.split()) or "AXIOM"
     lines = ["#separator:tab", "#html:true", "#notetype:Basic", f"#deck:{deck}", "#guid column:1", "#tags column:4"]
     for c in cards:
+        if c.get("figure"):
+            continue  # this single-file format cannot carry figure media
         back = to_anki_math(c["back"]) + f"<br><small>{html.escape(c['source'])}</small>"
         lines.append("\t".join([c["guid"], to_anki_math(c["front"]), back, " ".join(c["tags"])]))
     return "\n".join(lines) + "\n"
@@ -93,7 +77,10 @@ CSS = (".card{font-family:Georgia,serif;font-size:19px;text-align:left;color:#11
 
 
 def _fields(c: dict) -> list[str]:
-    return [to_anki_math(c["front"]), to_anki_math(c["back"]), html.escape(c["source"]), c["guid"]]
+    front = to_anki_math(c["front"])
+    if c.get("media_name"):
+        front += f'<br><img src="{html.escape(c["media_name"], quote=True)}" alt="Source figure">'
+    return [front, to_anki_math(c["back"]), html.escape(c["source"]), c["guid"]]
 
 
 def _deck_id(deck: str) -> int:
@@ -105,10 +92,17 @@ def to_apkg(cards: list[dict], deck: str, path) -> int:
     model = genanki.Model(MODEL_ID, MODEL_NAME, fields=[{"name": f} for f in FIELDS],
                           templates=[{"name": "Card 1", "qfmt": QFMT, "afmt": AFMT}], css=CSS)
     d = genanki.Deck(_deck_id(deck), deck)
+    cards, media = _with_media(cards)
     for c in cards:
         d.add_note(genanki.Note(model=model, fields=_fields(c), guid=c["guid"],
                                 tags=[t.replace(" ", "_") for t in c["tags"]]))
-    genanki.Package(d).write_to_file(str(path))
+    with TemporaryDirectory() as tmp:
+        paths = []
+        for name, png in media.items():
+            p = Path(tmp) / name
+            p.write_bytes(png)
+            paths.append(str(p))
+        genanki.Package(d, media_files=paths).write_to_file(str(path))
     return len(cards)
 
 
@@ -131,6 +125,9 @@ def push_ankiconnect(cards: list[dict], deck: str, url: str = "http://127.0.0.1:
         inv("createModel", modelName=MODEL_NAME, inOrderFields=FIELDS, css=CSS,
             cardTemplates=[{"Name": "Card 1", "Front": QFMT, "Back": AFMT}])
     inv("createDeck", deck=deck)
+    cards, media = _with_media(cards)
+    for name, png in media.items():
+        inv("storeMediaFile", filename=name, data=base64.b64encode(png).decode("ascii"))
     added = updated = 0
     for c in cards:
         fields = dict(zip(FIELDS, _fields(c)))

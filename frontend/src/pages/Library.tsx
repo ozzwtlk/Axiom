@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { listDocuments, listImports, uploadDocument } from "../api/client";
+import { listDocuments, listImports, MOCK, removeDocument, uploadDocument } from "../api/client";
+import { StatusBadge } from "../components/StatusBadge";
 import type { DocumentSummary, PendingImport } from "../api/types";
 import { Cover } from "./DocumentPage";
 
@@ -8,6 +9,7 @@ export function Library() {
   const [docs, setDocs] = useState<DocumentSummary[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [removing, setRemoving] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [imports, setImports] = useState<PendingImport[]>([]);
@@ -19,11 +21,26 @@ export function Library() {
   useEffect(() => {
     refresh();
   }, []);
-  useEffect(() => {  // a computing machine imports queued uploads: watch for them to appear
-    if (!imports.length) return;
-    const t = window.setInterval(refresh, 5000);
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      if (document.visibilityState === "visible" && !removing) refresh();
+    }, 8000);
     return () => window.clearInterval(t);
-  }, [imports.length]);
+  }, [removing]);
+
+  const onRemove = async (doc: DocumentSummary) => {
+    if (!window.confirm(`Remove “${doc.title}” and its processed data from AXIOM? Your original upload is not affected.`)) return;
+    setRemoving(doc.id);
+    setErr(null);
+    try {
+      await removeDocument(doc.id);
+      await refresh();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setRemoving(null);
+    }
+  };
 
   const onUpload = async (f: File | undefined) => {
     if (!f) return;
@@ -54,16 +71,23 @@ export function Library() {
       {docs && (
         <div className="lib-grid">
           {docs.map((d) => (
-            <Link key={d.id} to={`/doc/${d.id}`} className="book-card">
-              <Cover docId={d.id} title={d.title} />
-              <div className="book-title">{d.title}</div>
-              <div className="book-meta">
-                {d.chapters_done} of {d.chapters_total} chapters ready · {d.page_count} pages
-              </div>
-              <div className="bar" aria-label={`${d.chapters_done} of ${d.chapters_total} chapters processed`}>
-                <div style={{ width: `${d.chapters_total ? (100 * d.chapters_done) / d.chapters_total : 0}%` }} />
-              </div>
-            </Link>
+            <article key={d.id} className="book-entry">
+              <Link to={`/doc/${d.id}`} className="book-card">
+                <Cover docId={d.id} title={d.title} revision={d.cover_revision} />
+                <div className="book-title">{d.title}</div>
+                <div className="book-meta">
+                  {d.chapters_done} of {d.chapters_total} chapters ready · {d.page_count} pages
+                  {d.completed && <> · <StatusBadge status="done" /></>}
+                </div>
+                <div className="bar" aria-label={`${d.chapters_done} of ${d.chapters_total} chapters processed`}>
+                  <div style={{ width: `${d.chapters_total ? (100 * d.chapters_done) / d.chapters_total : 0}%` }} />
+                </div>
+              </Link>
+              {!MOCK && <button type="button" className="link-btn small book-remove" disabled={removing !== null}
+                                aria-label={`Remove ${d.title}`} onClick={() => onRemove(d)}>
+                {removing === d.id ? "Removing…" : "Remove"}
+              </button>}
+            </article>
           ))}
           {imports.map((im) => (
             <div key={im.id} className="book-card pending-import">

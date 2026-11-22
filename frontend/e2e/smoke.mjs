@@ -30,8 +30,16 @@ await page.goto(BASE + "/", { waitUntil: "networkidle" });
 check("library lists the document", (await page.textContent("body")).includes(doc.title.slice(0, 20)));
 await page.goto(`${BASE}/doc/${doc.id}`, { waitUntil: "networkidle" });
 check("document page shows chapters", (await page.locator(".chapter").count()) === doc.chapters.length);
-check("study tools: apkg link", (await page.locator('a:has-text("Download .apkg")').count()) === 1);
+const cards = await api(`/documents/${doc.id}/anki?format=json`);
+check("study tools: generate or export", cards.length
+  ? (await page.getByRole("link", { name: "Download .apkg" }).count()) === 1
+  : (await page.getByRole("button", { name: /Generate study cards|sections queued or running/ }).count()) === 1);
+check("book offers a Codex-generated cover", (await page.getByRole("button", { name: /cover with Codex|Cover queued/ }).count()) === 1);
 check("chapter exam link", (await page.locator('a:has-text("exam")').count()) >= 1);
+
+await page.getByRole("link", { name: "Jobs", exact: true }).click();
+await page.getByRole("heading", { name: /^Waiting/ }).waitFor();
+check("jobs tab shows queue and running work", (await page.getByRole("heading", { name: /^Running/ }).count()) === 1);
 
 // reader: three levels
 await page.goto(`${BASE}/read/${reading.id}`, { waitUntil: "networkidle" });

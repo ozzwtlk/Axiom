@@ -3,11 +3,11 @@ import type { Status } from "../api/types";
 const LABEL: Record<Status, string> = {
   pending: "pending",
   running: "processing",
-  done: "ready",
+  done: "completed",
   partial: "partial",
   failed: "failed",
 };
-const ICON: Record<Status, string> = { pending: "○", running: "◔", done: "●", partial: "◑", failed: "✕" };
+const ICON: Record<Status, string> = { pending: "○", running: "◔", done: "✓", partial: "◑", failed: "✕" };
 
 export function StatusBadge({ status }: { status: Status }) {
   return (

@@ -42,7 +42,27 @@ PROMPT_TEXT = (
 EXTRA_EQ = "This crop is a displayed equation; put the mathematics in $$...$$ (any connecting words like 'or' outside it). "
 EXTRA_EX = "This crop is a numbered exercise; keep its number and sub-part labels like (a), (b). "
 
+RETRY_TEXT = ("\n\nA first reading of this crop produced LaTeX that does not render ({err}). Use only standard "
+              "LaTeX that KaTeX supports: no \\eqno, no upgreek (\\upomega), no \\slashed; write ordinary words "
+              "outside math, not letter by letter inside \\mathrm.")
+
 WORD_RE = re.compile(r"[A-Za-z]{4,}")
+
+
+def _repair_math(md: str) -> str:
+    """Deterministic syntax repair of segments KaTeX rejects (quality.repair_tex); letter-spaced prose displays
+    become prose."""
+    from axiom.verification import quality
+    md = quality.normalize_md(md)
+    segs = latex.extract_math(md)
+    if not segs or not latex.available():
+        return md
+    for (seg, disp), err in zip(segs, latex.check(segs)):
+        if err:
+            fixed = quality.repair_tex(seg)
+            if fixed != seg and not latex.check([(fixed, disp)])[0]:
+                md = md.replace(seg, fixed, 1)
+    return md
 
 
 def _words(s: str) -> Counter:
@@ -126,8 +146,18 @@ def _transcribe_one(b, doc_id: str, section_id: str, profile: str) -> tuple[str,
             return "text_layer", False
         extra = EXTRA_EQ if b["block_type"] == "equation" else EXTRA_EX if b["block_type"] == "exercise" else ""
         req = ChatRequest(SYSTEM, PROMPT_TEXT.format(extra=extra), [ImagePart(png)], max_tokens=2500)
-        res, cached = llm.call("transcribe", models.resolve("transcribe", None, profile, local_as="local_vlm"), req, PROMPT_VERSION, doc_id=doc_id, profile=profile)
+        route = models.resolve("transcribe", None, profile, local_as="local_vlm")
+        res, cached = llm.call("transcribe", route, req, PROMPT_VERSION, doc_id=doc_id, profile=profile)
         md = _strip_tag(res.text, b["eq_number"] if b["block_type"] == "equation" else None)
+        errs = latex.check_markdown(md)
+        if errs:  # one more reading, told what went wrong (a new prompt, so the first answer stays cached)
+            req2 = ChatRequest(SYSTEM, PROMPT_TEXT.format(extra=extra) + RETRY_TEXT.format(err=errs[0][:200]),
+                               [ImagePart(png)], max_tokens=2500)
+            res2, _ = llm.call("transcribe", route, req2, PROMPT_VERSION, doc_id=doc_id, profile=profile)
+            md2 = _strip_tag(res2.text, b["eq_number"] if b["block_type"] == "equation" else None)
+            if len(latex.check_markdown(md2)) < len(errs):
+                md = md2
+        md = _repair_math(md)
         if b["block_type"] == "equation" and not b["eq_number"] and looks_like_prose(md):
             with db.connect() as c:  # segmentation error corrected by transcription evidence
                 c.execute("UPDATE blocks SET block_type='paragraph' WHERE id=?", (b["id"],))
@@ -174,6 +204,18 @@ def transcribe_section(section_id: str, profile: str = "economy", should_stop=la
         for method, cached in ex.map(lambda b: ctx.copy().run(work, b), todo):
             stats["vision" if method == "vision_ocr" else "text_layer"] += 1
             stats["cached"] += int(cached)
+    # block-level quality control before the optimizer sees the text (page numbers, text cut out as images,
+    # lines caught twice); regions that turned out to be text are read once more
+    from axiom.verification import quality
+    q = quality.clean_blocks(section_id)
+    stats["quality"] = q["fixed"]
+    redo = [b for b in db.q("SELECT * FROM blocks WHERE section_id=? AND transcription_method='none'", (section_id,))
+            if b["id"] in q["retranscribe"]]
+    for b in redo:
+        method, cached = ctx.copy().run(work, b)
+        stats["vision" if method == "vision_ocr" else "text_layer"] += 1
+    if redo:
+        quality.clean_blocks(section_id)
     with db.connect() as c:
         c.execute("UPDATE sections SET stage='transcribed' WHERE id=? AND stage IN ('none','extracted')", (section_id,))
     return stats

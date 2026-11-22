@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ankiUrl, getDocument, getMastery, getProgress, MOCK, pageImageUrl, processDocument, pushToAnki } from "../api/client";
+import { ankiUrl, blockImageUrl, coverUrl, getDocument, getMastery, getProgress, getStudyCards, MOCK, pageImageUrl, processDocument, pushToAnki, queueAnki, queueCover, restructureDocument } from "../api/client";
+import { Md } from "../components/Md";
 import type { DocumentDetail, Profile, ProgressReport } from "../api/types";
 import { jobsRunning, ProgressPanel } from "../components/ProgressPanel";
+import { QualityPanel } from "../components/QualityPanel";
 import { Icon } from "../components/Icon";
 import { SearchBox } from "../components/SearchBox";
 import { isOpenable, StatusBadge } from "../components/StatusBadge";
@@ -27,6 +29,7 @@ export function DocumentPage() {
   const [parallel, setParallel] = useState<boolean>(() => load<boolean>("axiom.processParallel", false));
   const premiumRun = procModel !== "auto" && procModel !== "local";
   const [submitting, setSubmitting] = useState(false);
+  const [coverSubmitting, setCoverSubmitting] = useState(false);
   const [kick, setKick] = useState(0); // forces polling right after submitting
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
   const [mastery, setMastery] = useState<Record<string, number>>({});
@@ -98,7 +101,13 @@ export function DocumentPage() {
 
   const firstOpen = doc.chapters.flatMap((c) => c.sections).find((s) => isOpenable(s.status));
   const pct = doc.chapters_total ? Math.round((100 * doc.chapters_done) / doc.chapters_total) : 0;
-  const unprocessed = doc.chapters.filter((c) => c.status !== "done").map((c) => c.number);
+  const unprocessed = doc.chapters.filter((c) => !c.completed).map((c) => c.number);
+  const coverJob = progress?.jobs.filter((j) => j.kind === "cover").at(-1);
+  const coverPending = coverSubmitting || coverJob?.status === "pending" || coverJob?.status === "running";
+  const onStarted = () => {
+    setKick(3);
+    return refresh();
+  };
 
   return (
     <main className="page page-wide">
@@ -106,12 +115,29 @@ export function DocumentPage() {
         <Link to="/">Library</Link> <span aria-hidden="true">/</span> <span>{doc.title.split(":")[0]}</span>
       </nav>
       <section className="doc-hero">
-        <Cover docId={doc.id} title={doc.title} />
+        <Cover docId={doc.id} title={doc.title} revision={doc.cover_revision} />
         <div>
           <span className="eyebrow">Textbook</span>
           <h1>{doc.title}</h1>
           <div className="doc-hero-meta">
-            {doc.page_count} pages · {doc.chapters.length} chapters
+            {doc.page_count} pages · {doc.chapters.length} chapters ·{" "}
+            <button
+              type="button"
+              className="link-btn"
+              title="Read the chapters and sections from the PDF outline again (only before processing starts)"
+              onClick={async () => {
+                setErr(null);
+                try {
+                  const r = await restructureDocument(doc.id);
+                  await refresh();
+                  if (!r.changed) setErr("The PDF has no usable outline; the document stays one section.");
+                } catch (e) {
+                  setErr(e instanceof Error ? e.message : String(e));
+                }
+              }}
+            >
+              re-read outline
+            </button>
           </div>
           <div className="doc-hero-progress">
             <div className="bar" aria-label={`${doc.chapters_done} of ${doc.chapters_total} chapters ready`}>
@@ -119,6 +145,7 @@ export function DocumentPage() {
             </div>
             <span>
               {doc.chapters_done} of {doc.chapters_total} chapters ready
+              {doc.completed && <> · <StatusBadge status="done" /></>}
             </span>
           </div>
           <div className="doc-actions">
@@ -134,7 +161,20 @@ export function DocumentPage() {
               )
             )}
             <SearchBox docId={doc.id} />
+            {!MOCK && <button type="button" className="btn btn-quiet" disabled={coverPending} onClick={async () => {
+              setCoverSubmitting(true);
+              setErr(null);
+              try {
+                await queueCover(doc.id);
+                await onStarted();
+              } catch (e) {
+                setErr((e as Error).message);
+              } finally {
+                setCoverSubmitting(false);
+              }
+            }}>{coverPending ? "Cover queued or running…" : `${doc.cover_revision ? "Regenerate" : "Generate"} cover with Codex`}</button>}
           </div>
+          {coverJob?.status === "failed" && <p className="small error">Cover generation failed. <Link to="/jobs">See Jobs</Link>.</p>}
         </div>
       </section>
       {err && <p className="error">{err}</p>}
@@ -182,13 +222,13 @@ export function DocumentPage() {
                       </span>
                     </button>
                     <div className="chapter-actions">
-                      {c.status !== "done" && <StatusBadge status={c.status} />}
+                      {(c.status !== "done" || c.completed) && <StatusBadge status={c.status} />}
                       {ready && (
                         <Link className="btn btn-quiet btn-sm" to={`/quiz/chapter/${c.id}`} title="Exam on this chapter">
                           <Icon name="target" /> Chapter exam
                         </Link>
                       )}
-                      {c.status !== "done" && (
+                      {!c.completed && (
                         <label className="chapter-check" title="Select for processing">
                           <input
                             type="checkbox"
@@ -222,7 +262,7 @@ export function DocumentPage() {
                             </span>
                           )}
                           {s.is_exercises && <span className="tag">exercises</span>}
-                          {s.status !== "done" && <StatusBadge status={s.status} />}
+                          {(s.status !== "done" || s.completed) && <StatusBadge status={s.status} />}
                           {mastery[s.id] !== undefined && (
                             <span className="mastery-bar" title={`Mastery: best ${Math.round(mastery[s.id] * 100)}% in checks`}>
                               <span style={{ width: `${Math.round(mastery[s.id] * 100)}%` }} />
@@ -240,7 +280,7 @@ export function DocumentPage() {
         </section>
 
         <div className="doc-side">
-          <StudyTools doc={doc} />
+          <StudyTools key={doc.id} doc={doc} progress={progress} onStarted={onStarted} />
           {(unprocessed.length > 0 || selected.size > 0) && (
             <section className="card side-card" aria-label="Process chapters">
               <h3>Process chapters</h3>
@@ -306,6 +346,16 @@ export function DocumentPage() {
               </div>
             </section>
           )}
+          <QualityPanel
+            docId={doc.id}
+            model={procModel}
+            profile={profile}
+            tick={(progress?.sections_done ?? 0) * 1000 + (progress?.jobs.filter((j) => j.status === "done").length ?? 0)}
+            onStarted={() => {
+              setKick(3);
+              refresh();
+            }}
+          />
           {progress && <ProgressPanel p={progress} polling={polling} />}
         </div>
       </div>
@@ -314,12 +364,14 @@ export function DocumentPage() {
 }
 
 /** Book cover from the scan's first page (falls back to the title). */
-export function Cover({ docId, title }: { docId: string; title: string }) {
-  const [failed, setFailed] = useState(false);
+export function Cover({ docId, title, revision }: { docId: string; title: string; revision?: string | null }) {
+  const [failed, setFailed] = useState<string[]>([]);
+  const src = [revision ? coverUrl(docId, revision) : null, pageImageUrl(docId, 1)]
+    .find((url): url is string => url !== null && !failed.includes(url));
   return (
     <div className="book-cover">
-      {!failed && !MOCK ? (
-        <img src={pageImageUrl(docId, 1)} alt="" loading="lazy" onError={() => setFailed(true)} />
+      {src && !MOCK ? (
+        <img key={src} src={src} alt="" loading="lazy" onError={() => setFailed((urls) => [...urls, src])} />
       ) : (
         <div className="book-cover-fallback">{title}</div>
       )}
@@ -327,10 +379,32 @@ export function Cover({ docId, title }: { docId: string; title: string }) {
   );
 }
 
-function StudyTools({ doc }: { doc: DocumentDetail }) {
-  const [deck, setDeck] = useState(() => doc.title.split(":")[0].slice(0, 40) || "AXIOM");
+function StudyTools({ doc, progress, onStarted }: { doc: DocumentDetail; progress: ProgressReport | null; onStarted: () => Promise<unknown> }) {
+  const [deck, setDeck] = useState(() => `${doc.title.split(":")[0].slice(0, 40) || "AXIOM"} · Study`);
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [cards, setCards] = useState<Awaited<ReturnType<typeof getStudyCards>>>([]);
+  const jobs = progress?.jobs.filter((j) => j.kind === "anki") ?? [];
+  const active = jobs.filter((j) => j.status === "pending" || j.status === "running").length;
+  const finished = jobs.filter((j) => j.status === "done").map((j) => `${j.id}:${j.updated_at}`).join();
+  useEffect(() => {
+    let current = true;
+    getStudyCards(doc.id).then((c) => { if (current) setCards(c); }).catch((e) => { if (current) setMsg(e.message); });
+    return () => { current = false; };
+  }, [doc.id, finished]);
+  const generate = async (regenerate = false) => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const { job_ids } = await queueAnki(doc.id, regenerate);
+      if (!job_ids.length) setMsg("No new verified sections to generate from.");
+      await onStarted();
+    } catch (e) {
+      setMsg((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
   const push = async () => {
     setBusy(true);
     setMsg(null);
@@ -358,10 +432,28 @@ function StudyTools({ doc }: { doc: DocumentDetail }) {
         <span className="icon-box"><Icon name="cards" /></span>
         <span>
           <strong>Anki flashcards</strong>
-          <span className="muted">Checked definitions, results and key equations</span>
+          <span className="muted">Standalone reasoning, ansatz, short derivations and source figures.</span>
         </span>
       </div>
-      <label className="field">
+      {!MOCK && <div className="export-row">
+        <button type="button" className="btn btn-sm" disabled={busy || active > 0} onClick={() => generate()}>
+          {active ? `${active} sections queued or running` : cards.length ? "Add newly verified sections" : "Generate study cards"}
+        </button>
+        {!!finished && !active && <button type="button" className="link-btn small" disabled={busy} onClick={() => generate(true)}>Rebuild</button>}
+      </div>}
+      {jobs.some((j) => j.status === "failed") && <p className="small error">Some card jobs failed. <Link to="/jobs">See Jobs</Link>.</p>}
+      <p className="small muted">AI-generated and model-reviewed. At most 10 cards per chapter and 100 per book.</p>
+      {!!cards.length && <details className="study-preview">
+        <summary>Preview ({cards.length} cards)</summary>
+        {cards.slice(0, 5).map((card) => <details key={card.guid}>
+          <summary>{card.front.split("\n")[0].replace(/\$+$/, "").slice(0, 110)}{card.front.length > 110 ? "…" : ""}</summary>
+          <Md src={card.front} />
+          {card.figure && <img src={blockImageUrl(card.figure)} alt="Source figure" loading="lazy" />}
+          <Md src={card.back} />
+          <small className="muted">{card.source}</small>
+        </details>)}
+      </details>}
+      {!!cards.length && <><label className="field">
         Deck name
         <input type="text" value={deck} onChange={(e) => setDeck(e.target.value)} />
       </label>
@@ -369,14 +461,14 @@ function StudyTools({ doc }: { doc: DocumentDetail }) {
         <a className="btn btn-sm" href={ankiUrl(doc.id, "apkg", deck)} download>
           Download .apkg
         </a>
-        <a className="btn btn-quiet btn-sm" href={ankiUrl(doc.id, "tsv", deck)} download>
-          .txt
-        </a>
+        {cards.some((c) => !c.figure) && <a className="btn btn-quiet btn-sm" href={ankiUrl(doc.id, "tsv", deck)} download>
+          .txt (no figures)
+        </a>}
         <button type="button" className="link-btn small" disabled={busy} onClick={push} title="Needs Anki running with the AnkiConnect add-on">
           {busy ? "Sending…" : "Send to Anki"}
         </button>
-      </div>
-      {msg && <p className="small">{msg}</p>}
+      </div></>}
+      {msg && <p className="small" role="status">{msg}</p>}
     </section>
   );
 }

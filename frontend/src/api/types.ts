@@ -15,6 +15,8 @@ export interface DocumentSummary {
   created_at: string;
   chapters_total: number;
   chapters_done: number;
+  completed: boolean;
+  cover_revision: string | null;
 }
 
 export interface SectionSummary {
@@ -24,6 +26,7 @@ export interface SectionSummary {
   page_start: number; // 1-based PDF page index
   page_end: number;
   status: Status;
+  completed: boolean;
   is_exercises: boolean;
 }
 
@@ -34,6 +37,7 @@ export interface ChapterSummary {
   page_start: number;
   page_end: number;
   status: Status;
+  completed: boolean;
   sections: SectionSummary[];
 }
 
@@ -59,6 +63,14 @@ export interface UnitSource {
 
 export type Level = 1 | 2 | 3;
 
+export type NoteKind = "key" | "intuition" | "pitfall" | "recall" | "check";
+
+/** AI-written study note (shown at Standard and Deep Dive, always labelled). */
+export interface StudyNote {
+  kind: NoteKind;
+  md: string;
+}
+
 export interface Unit {
   id: string;
   kind: UnitKind;
@@ -77,6 +89,23 @@ export interface Unit {
   figure_url: string | null;
   /** independent faithfulness check; null = not applicable / not run yet */
   verification: "verified" | "flagged" | "reverted" | "unchecked" | null;
+  notes: StudyNote[];
+  /** a saved visualization exists for this unit */
+  has_visualization: boolean;
+}
+
+// ---------------------------------------------------------------- cross-references
+export interface XrefTarget {
+  block_id: string;
+  section_id: string;
+  page: number;
+}
+export interface Xrefs {
+  equations: Record<string, XrefTarget & { latex: string | null }>;
+  figures: Record<string, XrefTarget & { caption: string; image_url: string | null }>;
+  sections: Record<string, { section_id: string; title: string }>;
+  chapters: Record<string, { section_id: string; title: string }>;
+  unresolved: { kind: "equation" | "figure" | "section"; ref: string; section_id: string }[];
 }
 
 export interface ExerciseSummary {
@@ -280,6 +309,8 @@ export interface Visualization {
   ai_generated: boolean;
   reviewed?: boolean | null;
   review_notes?: string[] | null;
+  /** generated automatically while the book was processed */
+  automatic?: boolean | null;
 }
 
 // ---------------------------------------------------------------- models & routing
@@ -316,6 +347,8 @@ export interface Routing {
   groups: Record<TaskGroup, string>;
   premium_default: string;
   cloud_enabled: boolean;
+  /** model for diagrams generated automatically during processing, or "off" */
+  auto_diagrams: string;
 }
 
 // ---------------------------------------------------------------- computing machines (server mode)
@@ -344,4 +377,30 @@ export interface PendingImport {
   filename: string;
   status: string;
   error: string | null;
+}
+
+export interface QualityIssue {
+  kind: "not_optimized" | "bad_transcription" | "unchecked" | "empty" | "coverage";
+  needs: string;
+  message: string;
+  units?: string[];
+  blocks?: string[];
+}
+
+export interface QualitySection {
+  section_id: string;
+  number: string;
+  title: string;
+  chapter: number;
+  status: Status;
+  issues: QualityIssue[];
+  checked: boolean;
+}
+
+export interface QualityReport {
+  sections_processed: number;
+  sections_checked: number;
+  fixed: Record<string, number>;
+  open: Record<string, number>;
+  sections: QualitySection[];
 }

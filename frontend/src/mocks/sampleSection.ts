@@ -21,8 +21,10 @@ function u(p: Partial<Unit> & Pick<Unit, "id" | "kind" | "text_md">): Unit {
     flags: [],
     figure_url: null,
     verification: null,
+    notes: [],
+    has_visualization: false,
     ...p,
-  };
+  } as Unit;
 }
 
 export const sampleSection: SectionView = {
@@ -163,21 +165,23 @@ export const mockDocument: DocumentDetail = {
   created_at: "2026-11-19T10:00:00Z",
   chapters_total: 2,
   chapters_done: 0,
+  completed: false,
+  cover_revision: null,
   chapters: [
     {
-      id: "c-1", number: 1, title: "Special Relativity and Flat Spacetime", page_start: 17, page_end: 64, status: "partial",
+      id: "c-1", number: 1, title: "Special Relativity and Flat Spacetime", page_start: 17, page_end: 64, status: "partial", completed: false,
       sections: [
-        { id: "s-1-1", number: "1.1", title: "Prelude", page_start: 17, page_end: 17, status: "pending", is_exercises: false },
-        { id: "s-1-2", number: "1.2", title: "Space and Time, Separately and Together", page_start: 17, page_end: 20, status: "done", is_exercises: false },
-        { id: "s-1-3", number: "1.3", title: "Lorentz Transformations", page_start: 21, page_end: 25, status: "partial", is_exercises: false },
-        { id: "s-1-4", number: "1.4", title: "Vectors", page_start: 25, page_end: 29, status: "running", is_exercises: false },
-        { id: "s-1-x", number: "1.12", title: "Exercises", page_start: 48, page_end: 50, status: "pending", is_exercises: true },
+        { id: "s-1-1", number: "1.1", title: "Prelude", page_start: 17, page_end: 17, status: "pending", completed: false, is_exercises: false },
+        { id: "s-1-2", number: "1.2", title: "Space and Time, Separately and Together", page_start: 17, page_end: 20, status: "done", completed: true, is_exercises: false },
+        { id: "s-1-3", number: "1.3", title: "Lorentz Transformations", page_start: 21, page_end: 25, status: "partial", completed: false, is_exercises: false },
+        { id: "s-1-4", number: "1.4", title: "Vectors", page_start: 25, page_end: 29, status: "running", completed: false, is_exercises: false },
+        { id: "s-1-x", number: "1.12", title: "Exercises", page_start: 48, page_end: 50, status: "pending", completed: false, is_exercises: true },
       ],
     },
     {
-      id: "c-2", number: 2, title: "Manifolds", page_start: 65, page_end: 109, status: "pending",
+      id: "c-2", number: 2, title: "Manifolds", page_start: 65, page_end: 109, status: "pending", completed: false,
       sections: [
-        { id: "s-2-1", number: "2.1", title: "Gravity as Geometry", page_start: 65, page_end: 70, status: "pending", is_exercises: false },
+        { id: "s-2-1", number: "2.1", title: "Gravity as Geometry", page_start: 65, page_end: 70, status: "pending", completed: false, is_exercises: false },
       ],
     },
   ],
@@ -186,7 +190,7 @@ export const mockDocument: DocumentDetail = {
 export const mockDocuments: DocumentSummary[] = [
   {
     id: mockDocument.id, title: mockDocument.title, page_count: mockDocument.page_count,
-    created_at: mockDocument.created_at, chapters_total: 2, chapters_done: 0,
+    created_at: mockDocument.created_at, chapters_total: 2, chapters_done: 0, completed: false, cover_revision: null,
   },
 ];
 

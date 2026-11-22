@@ -10,6 +10,7 @@
  */
 import katex from "katex";
 import MarkdownIt from "markdown-it";
+import { linkifyHtml, subscribeXrefs } from "./xrefs";
 
 const md = new MarkdownIt({ html: false, linkify: false, typographer: false, breaks: false });
 
@@ -195,6 +196,11 @@ function restore(html: string, math: MathSegment[]): string {
 
 const blockCache = new Map<string, string>();
 const inlineCache = new Map<string, string>();
+// rendered HTML depends on the cross-reference index: start over when it changes
+subscribeXrefs(() => {
+  blockCache.clear();
+  inlineCache.clear();
+});
 
 /** Render a Markdown string (block-level) with math. Never throws. Memoized. */
 export function renderMarkdown(src: string | null | undefined): string {
@@ -204,7 +210,7 @@ export function renderMarkdown(src: string | null | undefined): string {
   let html: string;
   try {
     const { text, math } = extractMath(src);
-    html = restore(md.render(text), math);
+    html = restore(linkifyHtml(md.render(text)), math);
     // A paragraph consisting solely of display math: unwrap so the block is not inside <p>.
     html = html.replace(/<p>\s*(<span class="katex-display">[\s\S]*?<\/span>)\s*<\/p>/g, (m, inner: string) =>
       countSpans(inner) ? `<div class="math-block">${inner}</div>` : m,
@@ -232,7 +238,7 @@ export function renderInline(src: string | null | undefined): string {
   let html: string;
   try {
     const { text, math } = extractMath(src);
-    html = restore(md.renderInline(text), math);
+    html = restore(linkifyHtml(md.renderInline(text)), math);
   } catch {
     html = escapeHtml(src);
   }

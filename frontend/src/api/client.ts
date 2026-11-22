@@ -1,6 +1,7 @@
 import type {
-  AnswerCheck, AskRequest, AskResponse, DocumentDetail, ExerciseMapItem, Quiz, QuizResult, Solution, Visualization, DocumentSummary, Exercise, HintResponse,
+  AnswerCheck, AskRequest, AskResponse, DocumentDetail, ExerciseMapItem, Quiz, QuizResult, Solution, Visualization, Xrefs, DocumentSummary, Exercise, HintResponse,
   ProcessRequest, ProcessResponse, ProgressReport, SearchHit, SectionView, SourceBlock, ModelsReport, Routing, TaskGroup, MachinesReport, PendingImport,
+  QualityReport,
 } from "./types";
 import * as M from "../mocks/sampleSection";
 
@@ -38,7 +39,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiError(res.status, `${res.status} ${detail}`);
   }
-  return (await res.json()) as T;
+  return res.status === 204 ? (undefined as T) : (await res.json()) as T;
 }
 
 function json(body: unknown): RequestInit {
@@ -64,6 +65,56 @@ export function uploadDocument(file: File): Promise<DocumentSummary | { queued: 
   return request("/documents", { method: "POST", body: fd });
 }
 
+export function removeDocument(docId: string) {
+  return request<void>(`/documents/${enc(docId)}`, { method: "DELETE" });
+}
+
+export function queueCover(docId: string) {
+  return request<{ job_id: string }>(`/documents/${enc(docId)}/cover`, { method: "POST" });
+}
+
+export function coverUrl(docId: string, revision: string) {
+  return `${BASE}/documents/${enc(docId)}/cover.png?v=${enc(revision)}`;
+}
+
+export function queueAnki(docId: string, regenerate = false) {
+  return request<ProcessResponse>(`/documents/${enc(docId)}/anki/generate?regenerate=${regenerate}`, { method: "POST" });
+}
+
+export function getStudyCards(docId: string) {
+  if (MOCK) return Promise.resolve([]);
+  return request<{ guid: string; front: string; back: string; source: string; figure?: string | null }[]>(`/documents/${enc(docId)}/anki?format=json`);
+}
+
+export interface QueuedJob {
+  id: string;
+  doc_id: string;
+  title: string | null;
+  kind: string;
+  target_id: string;
+  status: "pending" | "running" | "done" | "failed" | "cancelled";
+  depends_on: string[];
+  model: string | null;
+  model_group: string | null;
+  priority: number;
+  parallel: number;
+  worker: string | null;
+  error: string | null;
+}
+
+export function listJobs() {
+  if (MOCK) return Promise.resolve({ jobs: [] as QueuedJob[] });
+  return request<{ jobs: QueuedJob[] }>("/jobs");
+}
+
+export function changeJob(id: string, changes: { action: "model"; model: string | null } | { action: "move_first" }) {
+  return request<void>(`/jobs/${enc(id)}`, { ...json(changes), method: "PATCH" });
+}
+
+export function removeJob(id: string) {
+  return request<void>(`/jobs/${enc(id)}`, { method: "DELETE" });
+}
+
 export function getDocument(docId: string): Promise<DocumentDetail> {
   if (MOCK) return delay(M.mockDocument);
   return request(`/documents/${enc(docId)}`);
@@ -72,6 +123,19 @@ export function getDocument(docId: string): Promise<DocumentDetail> {
 export function processDocument(docId: string, body: ProcessRequest): Promise<ProcessResponse> {
   if (MOCK) return delay({ job_ids: body.chapters.map((c) => `mock-job-${c}`) });
   return request(`/documents/${enc(docId)}/process`, json(body));
+}
+
+export function getQuality(docId: string): Promise<QualityReport> {
+  return request(`/documents/${enc(docId)}/quality`);
+}
+
+/** Check all processed sections (no model); `rerun` also queues what still needs a model. */
+export function runQuality(docId: string, body: { rerun: boolean; profile?: string; model?: string }): Promise<{ job_ids: string[] }> {
+  return request(`/documents/${enc(docId)}/quality`, json(body));
+}
+
+export function restructureDocument(docId: string, force = false): Promise<{ chapters: number; changed: boolean }> {
+  return request(`/documents/${enc(docId)}/restructure${force ? "?force=true" : ""}`, json({}));
 }
 
 export function getProgress(docId: string): Promise<ProgressReport> {
@@ -165,6 +229,10 @@ export function pushToAnki(docId: string, deck: string, chapters?: number[]): Pr
 }
 
 // ---------------------------------------------------------------- visualizations
+export function getXrefs(docId: string): Promise<Xrefs> {
+  return request(`/documents/${enc(docId)}/xrefs`);
+}
+
 export function getVisualization(unitId: string): Promise<Visualization> {
   return request(`/units/${enc(unitId)}/visualization`);
 }
@@ -210,7 +278,7 @@ export function getRouting(): Promise<Routing> {
   return request("/settings/routing");
 }
 
-export function saveRouting(update: { groups?: Partial<Record<TaskGroup, string>>; premium_default?: string; cloud_enabled?: boolean }): Promise<Routing> {
+export function saveRouting(update: { groups?: Partial<Record<TaskGroup, string>>; premium_default?: string; cloud_enabled?: boolean; auto_diagrams?: string }): Promise<Routing> {
   return request("/settings/routing", { method: "PUT", headers: { "content-type": "application/json" },
     body: JSON.stringify({ groups: {}, ...update }) });
 }

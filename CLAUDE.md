@@ -33,6 +33,8 @@ cd frontend && pnpm dev   # :5173, proxies /api → :8000
 11. Subscription CLIs (`claude`, `codex`) run only through `model_adapters/cli_agents.py`: no tools, empty temp cwd, no user MCP/settings/hooks, no API keys in env, document text via stdin. Never add a tool or a writable dir.
 12. "Auto" may route to cloud models only when `cloud_enabled` is on; bulk groups stay local by default. All model choice goes through `models.resolve()`.
 14. Role "server" never computes: any endpoint that runs a model, parses a PDF or renders must call `require_compute()` first (api/internal.py). Workers reach data only through `db`/`files` (remote mode) — never open `settings.db_path` directly in pipeline code.
+15. Visualizations are anchored to source blocks; `optimize._store` carries them to the new unit ids (never deletes them). Async FastAPI handlers must not touch SQLite or disk directly (`asyncio.to_thread`): on the server a blocked loop deadlocks workers' remote transactions.
+16. `verification/quality.py` runs after every stage and may only delete, revert to source, mark blocks `artifact` or repair LaTeX *syntax* (never the mathematics, never new prose). A section is `done` only without open issues; re-processing a `partial` section must create fresh jobs (`jobs._forget_section_jobs`).
 13. llama.cpp gets our LaTeX-tolerant GBNF (`model_adapters/gbnf.py`), never its built-in json_schema mode (it forced `\lambda` → `\frac{\tilde…}`).
 
 ## Gotchas

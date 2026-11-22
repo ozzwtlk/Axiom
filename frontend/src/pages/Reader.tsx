@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { ask, getDocument, getExerciseMap, getSection, MOCK } from "../api/client";
+import { ask, getDocument, getExerciseMap, getSection, getXrefs, MOCK } from "../api/client";
+import { XrefLayer } from "../components/XrefLayer";
+import { setXrefs } from "../lib/xrefs";
 import type { AskAction, ChapterSummary, DocumentDetail, ExerciseMapItem, Level, SectionView } from "../api/types";
 import { AskDrawer, type AskEntry } from "../components/AskDrawer";
 import { AskToolbar, snapshotSelection, type SelectionSnapshot } from "../components/AskToolbar";
@@ -135,6 +137,25 @@ export function Reader() {
         /* sidebar degrades gracefully */
       });
   }, [docId, doc?.id]);
+
+  // ---- cross-reference index: "(2.13)", "Figure 1.5", "Section 2.4" become links ----
+  useEffect(() => {
+    if (!docId || MOCK) return;
+    let alive = true;
+    getXrefs(docId)
+      .then((x) => alive && setXrefs(x))
+      .catch(() => {
+        /* references simply stay plain text */
+      });
+    return () => {
+      alive = false;
+      setXrefs(null);
+    };
+  }, [docId]);
+  const goToRef = useCallback(
+    (sid: string, blockId?: string) => nav(`/read/${sid}`, { state: { blockId } satisfies NavState }),
+    [nav],
+  );
 
   const chapterNumber = sections.find((s) => s.id === current)?.chapter_number ?? sections[0]?.chapter_number;
   const chapter = doc?.chapters.find((c) => c.number === chapterNumber) ?? null;
@@ -564,6 +585,7 @@ export function Reader() {
         </nav>
 
         <main className="reader-main" ref={mainRef}>
+          <XrefLayer root={mainRef} go={goToRef} />
           {error && (
             <div className="notice error">
               {error} <Link to={docId ? `/doc/${docId}` : "/"}>Back</Link>
@@ -667,7 +689,7 @@ function SectionBlock({ section, level }: { section: SectionView; level: Level }
       </h2>
       {section.status === "partial" && (
         <p className="notice small">
-          Partially processed: some passages may be missing or unverified. Use “source” on any passage to see the scan.
+          Partially processed: some passages are shown verbatim or are not checked yet. “Fix with the model” in the book's Quality check re-runs only those parts; “source” on any passage shows the scan.
         </p>
       )}
       {tryFirst.length > 0 && (
