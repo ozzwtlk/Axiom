@@ -2,13 +2,16 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ankiUrl, blockImageUrl, coverUrl, getDocument, getMastery, getProgress, getStudyCards, MOCK, pageImageUrl, processDocument, pushToAnki, queueAnki, queueCover, restructureDocument } from "../api/client";
 import { Md } from "../components/Md";
+import { ModelPicker } from "../components/ModelPicker";
 import type { DocumentDetail, Profile, ProgressReport } from "../api/types";
 import { jobsRunning, ProgressPanel } from "../components/ProgressPanel";
+import { ProcessedCheck, ReadingPercent, ReadingStatus } from "../components/ReadingStatus";
+import { loadReading, summarizeReading } from "../lib/reading";
 import { QualityPanel } from "../components/QualityPanel";
 import { Icon } from "../components/Icon";
 import { SearchBox } from "../components/SearchBox";
 import { isOpenable, StatusBadge } from "../components/StatusBadge";
-import { useModelsReport } from "../lib/models";
+import { getModelChoice, useModelsReport } from "../lib/models";
 import { load, loadPosition, save } from "../lib/storage";
 
 export function DocumentPage() {
@@ -99,6 +102,10 @@ export function DocumentPage() {
   if (err && !doc) return <main className="page"><p className="error">{err}</p><Link to="/">← Library</Link></main>;
   if (!doc) return <main className="page"><p className="muted">Loading…</p></main>;
 
+  const reading = loadReading(doc.id);
+  if (pos) reading[pos.sectionId] ??= 0;
+  const readingIds = new Set(doc.reading_section_ids ?? []);
+  const bookReading = summarizeReading([...readingIds], reading);
   const firstOpen = doc.chapters.flatMap((c) => c.sections).find((s) => isOpenable(s.status));
   const pct = doc.chapters_total ? Math.round((100 * doc.chapters_done) / doc.chapters_total) : 0;
   const unprocessed = doc.chapters.filter((c) => !c.completed).map((c) => c.number);
@@ -145,9 +152,13 @@ export function DocumentPage() {
             </div>
             <span>
               {doc.chapters_done} of {doc.chapters_total} chapters ready
-              {doc.completed && <> · <StatusBadge status="done" /></>}
+              {doc.completed && <> · <ProcessedCheck /></>}
             </span>
           </div>
+          {!!readingIds.size && <div className="reading-line">
+            <ReadingPercent percent={bookReading.percent} />
+            {bookReading.touched && <ReadingStatus finished={bookReading.finished} />}
+          </div>}
           <div className="doc-actions">
             {pos ? (
               <Link className="btn" to={`/read/${pos.sectionId}`} state={{ unitId: pos.unitId }}>
@@ -200,6 +211,7 @@ export function DocumentPage() {
             {doc.chapters.map((c) => {
               const isCollapsed = collapsed.has(c.number);
               const ready = isOpenable(c.status);
+              const chapterReadingIds = c.sections.filter((s) => readingIds.has(s.id)).map((s) => s.id);
               return (
                 <li key={c.id} className={`chapter ${ready ? "is-done" : "is-pending"}`}>
                   <div className="chapter-row">
@@ -222,7 +234,8 @@ export function DocumentPage() {
                       </span>
                     </button>
                     <div className="chapter-actions">
-                      {(c.status !== "done" || c.completed) && <StatusBadge status={c.status} />}
+                      {c.status !== "done" ? <StatusBadge status={c.status} /> : c.completed && <ProcessedCheck />}
+                      {!!chapterReadingIds.length && <ReadingPercent percent={summarizeReading(chapterReadingIds, reading).percent} />}
                       {ready && (
                         <Link className="btn btn-quiet btn-sm" to={`/quiz/chapter/${c.id}`} title="Exam on this chapter">
                           <Icon name="target" /> Chapter exam
@@ -244,7 +257,7 @@ export function DocumentPage() {
                       </span>
                     </div>
                   </div>
-                  {!isCollapsed && ready && (
+                  {!isCollapsed && (
                     <ul className="sections">
                       {c.sections.map((s) => (
                         <li key={s.id} className="section-row">
@@ -262,7 +275,8 @@ export function DocumentPage() {
                             </span>
                           )}
                           {s.is_exercises && <span className="tag">exercises</span>}
-                          {(s.status !== "done" || s.completed) && <StatusBadge status={s.status} />}
+                          {s.status !== "done" ? <StatusBadge status={s.status} /> : s.completed && <ProcessedCheck />}
+                          {readingIds.has(s.id) && <ReadingPercent percent={reading[s.id] ?? 0} />}
                           {mastery[s.id] !== undefined && (
                             <span className="mastery-bar" title={`Mastery: best ${Math.round(mastery[s.id] * 100)}% in checks`}>
                               <span style={{ width: `${Math.round(mastery[s.id] * 100)}%` }} />
@@ -396,7 +410,7 @@ function StudyTools({ doc, progress, onStarted }: { doc: DocumentDetail; progres
     setBusy(true);
     setMsg(null);
     try {
-      const { job_ids } = await queueAnki(doc.id, regenerate);
+      const { job_ids } = await queueAnki(doc.id, regenerate, getModelChoice("anki"));
       if (!job_ids.length) setMsg("No new verified sections to generate from.");
       await onStarted();
     } catch (e) {
@@ -435,14 +449,17 @@ function StudyTools({ doc, progress, onStarted }: { doc: DocumentDetail; progres
           <span className="muted">Standalone reasoning, ansatz, short derivations and source figures.</span>
         </span>
       </div>
-      {!MOCK && <div className="export-row">
-        <button type="button" className="btn btn-sm" disabled={busy || active > 0} onClick={() => generate()}>
-          {active ? `${active} sections queued or running` : cards.length ? "Add newly verified sections" : "Generate study cards"}
-        </button>
-        {!!finished && !active && <button type="button" className="link-btn small" disabled={busy} onClick={() => generate(true)}>Rebuild</button>}
-      </div>}
+      {!MOCK && <>
+        <ModelPicker group="anki" label="Model for Anki generation" />
+        <div className="export-row">
+          <button type="button" className="btn btn-sm" disabled={busy || active > 0} onClick={() => generate()}>
+            {active ? `${active} sections queued or running` : cards.length ? "Add newly verified sections" : "Generate study cards"}
+          </button>
+          {!!finished && !active && <button type="button" className="link-btn small" disabled={busy} onClick={() => generate(true)}>Rebuild</button>}
+        </div>
+      </>}
       {jobs.some((j) => j.status === "failed") && <p className="small error">Some card jobs failed. <Link to="/jobs">See Jobs</Link>.</p>}
-      <p className="small muted">AI-generated and model-reviewed. At most 10 cards per chapter and 100 per book.</p>
+      <p className="small muted">AI-generated and model-reviewed. Up to about one card per two pages, based on chapter length and available verified material.</p>
       {!!cards.length && <details className="study-preview">
         <summary>Preview ({cards.length} cards)</summary>
         {cards.slice(0, 5).map((card) => <details key={card.guid}>

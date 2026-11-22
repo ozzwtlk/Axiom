@@ -142,7 +142,8 @@ def init(path: Path) -> None:
 
 _COLUMNS = {  # columns added after schema v1 (CREATE TABLE IF NOT EXISTS does not add them to old databases)
     "sections": [("digest_md", "TEXT"), ("start_y", "REAL")],
-    "jobs": [("model", "TEXT"), ("worker", "TEXT"), ("parallel", "INTEGER NOT NULL DEFAULT 0"), ("priority", "INTEGER NOT NULL DEFAULT 0")],
+    "jobs": [("model", "TEXT"), ("worker", "TEXT"), ("parallel", "INTEGER NOT NULL DEFAULT 0"), ("priority", "INTEGER NOT NULL DEFAULT 0"),
+             ("run_token", "TEXT"), ("requested_action", "TEXT"), ("restart_model", "TEXT")],
 }
 
 

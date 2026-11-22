@@ -29,6 +29,7 @@ Why not a vector DB: structure (document → chapter → section → block) + SQ
 
 ```
 ingest      copy PDF, hash, read outline → chapters/sections with page ranges      (deterministic)
+            missing/flat outline → try a numbered printed contents table, with page offsets checked against headings
 extract     OCR/text layer → lines with bbox+font size → semantic blocks              (deterministic)
             strip running heads/page numbers, detect display equations by "(n.m)"
             tags, captions, footnotes; score each block for "math suspicion"
@@ -70,13 +71,17 @@ for `optimize(s_{i-1})` (its summary is context). A section is readable after `o
 | Mastery checks / chapter exams | questions only from units that passed the faithfulness check, each citing its source units; every multiple-choice question is answered blind (key hidden) and dropped if the blind answer differs; MCQ graded deterministically, short answers by rubric |
 | Exercise-first mode | deterministic exercise→section map (shared concepts, cited equation numbers); practice page + "try first" box in the reader |
 | Visualizations | saved in `visualizations`, anchored to source blocks (`anchor_blocks`) so re-optimizing moves them to the unit that now shows the passage (none fits → kept as `detached:<section>:…`, re-attached later); shown automatically in the reader; "save as file" download. Model writes plain HTML/JS; static screen (no network/storage/parent access/eval/external URLs); served by the server inside its own document with `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; connect-src 'none' …`; embedded in `<iframe sandbox="allow-scripts">` without `allow-same-origin` |
-| Anki | Section jobs draft and review standalone reasoning, ansatz, derivation and figure cards using verified/source units; defaults to the local model. Per-section/chapter/book caps are 3/10/100. `.apkg` and AnkiConnect include genuine PDF figure crops; `.txt` is text-only. Notes use stable source-based IDs. Rebuilding or importing does not delete existing notes in Anki. |
+| Anki | Section jobs draft and review standalone reasoning, ansatz, derivation and figure cards using verified/source units; defaults to the local model, with a per-run model picker. Chapter and book export caps are half their page counts, rounded up; longer sections are processed in batches, and selection favors breadth across sections. `.apkg` and AnkiConnect include genuine PDF figure crops; `.txt` is text-only. Notes use stable source-based IDs. Rebuilding or importing does not delete existing notes in Anki. |
 
 ### Mathematical integrity rules (enforced in code, not prompts)
 1. Equation units always carry the **transcribed** LaTeX of the source equation; the optimizer can only attach annotations. Any rewrite of an equation is stored separately and marked `ai_generated`.
 2. Every equation and transcribed block keeps a link to its **source image crop**; the reader can always show the original scan.
 3. Transcriptions of scanned math are labelled `transcription: vision-ocr` with a confidence derived from evidence (OCR-vs-transcription token agreement, LaTeX parse success, equation-number match), not from model self-reports.
 4. Every source block ends up with a coverage status: `preserved | rewritten | merged | expandable | omitted | pending`. Omission requires a justification string. The audit is stored.
+
+### Reading progress
+
+Reading progress is stored per browser, independently of processing status. It tracks the furthest visible point in each non-exercise section at the chosen reading level. Chapter and book percentages average the eligible sections; unread sections count as zero. Empty chapter openings and exercise sections are excluded. Untouched books have no reading-status label.
 
 ### Three levels from one structure
 Each unit has `min_level ∈ {1,2,3}` and optional `fast_md` / `deep_md`. Level 1 shows units with `min_level=1` using `fast_md` when present; level 2 shows `min_level≤2` with `text_md`; level 3 shows everything plus `deep_md` (AI-added, labelled). No separate per-level generation.
@@ -109,7 +114,7 @@ All JSON. Base `/api`.
 | DELETE | `/documents/{doc_id}` | `204`; deletes AXIOM's library copy and derived state. Refused while any job for the book is queued or running. |
 | POST / GET | `/documents/{doc_id}/cover` / `/documents/{doc_id}/cover.png` | Queue a Codex cover design / read the locally rendered PNG; Codex receives only the title and a variation seed. |
 | GET | `/jobs` | Running work, queue priority order, dependencies, model overrides and history |
-| PATCH / DELETE | `/jobs/{job_id}` | For waiting jobs: change model, move to front, or cancel job and hard dependents. Priority does not override dependencies or worker capabilities. |
+| PATCH / DELETE | `/jobs/{job_id}` | Waiting jobs: change model, move to front, or remove. Running jobs: PATCH `{action: "abort"}` or `{action: "restart", model}` requests a stop at the next safe checkpoint. Abort cancels waiting hard dependents; restart retains the job ID and dependencies, reuses saved checkpoints, and queues the job with the new model. In-flight calls can finish. |
 | POST | `/documents/{doc_id}/process` body `{chapters: number[], profile: "economy"\|"balanced"\|"max"}` | `{job_ids: string[]}` |
 | GET | `/documents/{doc_id}/progress` | `ProgressReport` |
 | GET | `/sections/{section_id}` | `SectionView` |
@@ -121,7 +126,7 @@ All JSON. Base `/api`.
 | POST | `/exercises/{exercise_id}/hint` body `{level: 1..5}` | `{level, hint_md, model, cached}` |
 | GET | `/search?doc_id=&q=` | `SearchHit[]` |
 
-| POST | `/documents/{doc_id}/anki/generate[?regenerate=true]` | Queue study-card generation for verified sections; by default skip sections already generated. |
+| POST | `/documents/{doc_id}/anki/generate[?regenerate=true]` body `{model?}` | Queue study-card generation for verified sections. The chosen model drafts and reviews the cards; without an override, use the Anki routing setting. Skip sections already generated unless `regenerate=true`. |
 | GET | `/documents/{doc_id}/anki?format=apkg\|tsv\|json&deck=&chapters=` | `.apkg` / `.txt` download (also written to `data/exports/`) or card preview |
 | POST | `/documents/{doc_id}/anki/push` body `{deck, chapters?}` | `{added, updated, deck}` via AnkiConnect (127.0.0.1:8765) |
 | GET / POST | `/exercises/{id}/solution` | stored solution (GET, 404 if none) / generate it (POST, minutes) |
@@ -153,5 +158,5 @@ TypeScript shapes: see `frontend/src/api/types.ts` (mirrors `backend/axiom/api/s
   `files.fetch/publish` move PDFs. It executes forwarded requests against its own in-process app
   (`httpx.ASGITransport`) and runs the job loop. `jobs.can_run()`: only the selected machine (or anyone under
   auto) claims jobs, and only jobs whose model it has; `jobs.worker` records the claimant so a disconnect requeues
-  exactly its jobs.
+  exactly its jobs (honoring persisted abort/restart requests). Each claim has a run token so a stale attempt cannot finish a newer one.
 * Selection: `meta['compute.selected']` = `auto` | machine name; auto prefers a machine reporting a local model.

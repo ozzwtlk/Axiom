@@ -23,6 +23,7 @@ class DocumentSummary(BaseModel):
     chapters_done: int
     completed: bool = False
     cover_revision: str | None = None
+    reading_section_ids: list[str] = Field(default_factory=list)
 
 
 class SectionSummary(BaseModel):
@@ -99,6 +100,7 @@ class ExerciseSummary(BaseModel):
 
 
 class SectionView(BaseModel):
+    is_exercises: bool = False
     id: str
     document_id: str
     chapter_number: int

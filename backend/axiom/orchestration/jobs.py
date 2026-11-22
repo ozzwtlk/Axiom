@@ -26,7 +26,7 @@ from axiom.storage import db
 
 log = logging.getLogger("axiom.jobs")
 _stop = threading.Event()
-_cancel_requested: set[str] = set()
+_PIPELINE_STAGES = ("transcribe", "optimize", "verify")
 
 
 def _now() -> str:
@@ -162,16 +162,23 @@ def _extract_job(c, doc_id: str, ch, profile: str, model: str | None, parallel: 
 
 
 def cancel(job_id: str) -> None:
-    _cancel_requested.add(job_id)
-    with db.connect() as c:
-        c.execute("UPDATE jobs SET status='cancelled', updated_at=? WHERE id=? AND status='pending'", (_now(), job_id))
+    with db.connect(immediate=True) as c:
+        job = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if job and job["status"] == "running":
+            c.execute("UPDATE jobs SET requested_action='abort',restart_model=NULL,updated_at=? WHERE id=?", (_now(), job_id))
+        elif job and job["status"] == "pending":
+            _cancel_tree(c, job, "Removed from queue")
 
 
 def cancel_document(doc_id: str) -> int:
-    rows = db.q("SELECT id FROM jobs WHERE doc_id=? AND status IN ('pending','running')", (doc_id,))
-    for r in rows:
-        cancel(r["id"])
-    return len(rows)
+    with db.connect(immediate=True) as c:
+        rows = c.execute("SELECT * FROM jobs WHERE doc_id=? AND status IN ('pending','running')", (doc_id,)).fetchall()
+        c.execute("UPDATE jobs SET requested_action='abort',restart_model=NULL,updated_at=? "
+                  "WHERE doc_id=? AND status='running'", (_now(), doc_id))
+        for row in rows:
+            if row["status"] == "pending":
+                _cancel_row(c, row, "Removed from queue")
+        return len(rows)
 
 
 def reset(doc_id: str | None = None, include_done: bool = False) -> dict:
@@ -183,7 +190,6 @@ def reset(doc_id: str | None = None, include_done: bool = False) -> dict:
         n = c.execute(f"DELETE FROM jobs WHERE status IN {statuses} AND kind!='import'{where}", args).rowcount
         s = c.execute("UPDATE sections SET status='pending' WHERE status IN ('running','failed')"
                       + (" AND doc_id=?" if doc_id else ""), args).rowcount
-    _cancel_requested.clear()
     return {"jobs_removed": n, "sections_reset": s}
 
 
@@ -197,16 +203,19 @@ def enqueue_import(rel: str) -> str:
         return _add(c, "inbox", "import", rel, [], "economy")
 
 
-def recover() -> int:
-    with db.connect() as c:
-        # an interruption is not a failure: give the attempt back. A worker only reclaims its own jobs.
-        own = " AND worker=?" if WORKER_NAME else ""
-        args = (_now(), WORKER_NAME) if WORKER_NAME else (_now(),)
-        n = c.execute("UPDATE jobs SET status='pending', attempts=MAX(0, attempts-1), updated_at=? WHERE status='running'"
-                      + own, args).rowcount
-        if not WORKER_NAME:
+def recover(worker: str | None = None) -> int:
+    owner = worker or WORKER_NAME
+    with db.connect(immediate=True) as c:
+        own = " AND worker=?" if owner else ""
+        rows = c.execute("SELECT * FROM jobs WHERE status='running'" + own, (owner,) if owner else ()).fetchall()
+        for row in rows:
+            if not _apply_request(c, row):
+                c.execute("UPDATE jobs SET status='pending', attempts=MAX(0, attempts-1), worker=NULL, run_token=NULL, "
+                          "updated_at=? WHERE id=?", (_now(), row["id"]))
+                _release_section(c, row)
+        if not owner:
             c.execute("UPDATE sections SET status='pending' WHERE status='running'")
-    return n
+    return len(rows)
 
 
 _GROUP_OF_KIND = {"transcribe": "transcribe", "optimize": "optimize", "verify": "faithfulness",
@@ -225,7 +234,8 @@ def enqueue_cover(doc_id: str) -> str:
         return _add(c, doc_id, "cover", doc_id, [], "economy", "codex:default")
 
 
-def enqueue_anki(doc_id: str, regenerate: bool = False) -> list[str]:
+def enqueue_anki(doc_id: str, regenerate: bool = False, model: str | None = None) -> list[str]:
+    model = _validate_model("anki", model)
     ids = []
     with db.connect() as c:
         _lock_document(c, doc_id)
@@ -237,60 +247,104 @@ def enqueue_anki(doc_id: str, regenerate: bool = False) -> list[str]:
             if row["generated"] and not regenerate:
                 continue
             c.execute("DELETE FROM jobs WHERE target_id=? AND kind='anki' AND status='done'", (sid,))
-            ids.append(_add(c, doc_id, "anki", sid, [], "economy"))
+            ids.append(_add(c, doc_id, "anki", sid, [], "economy", model))
     return ids
 
 
 def queue_snapshot() -> list[dict]:
     return [dict(r, depends_on=json.loads(r["depends_on"]), model_group=_GROUP_OF_KIND.get(r["kind"]))
             for r in db.q("SELECT j.id,j.doc_id,j.kind,j.target_id,j.status,j.depends_on,j.model,j.worker,"
-                          "j.priority,j.parallel,j.error,d.title FROM jobs j LEFT JOIN documents d ON d.id=j.doc_id "
+                          "j.priority,j.parallel,j.error,j.requested_action,j.restart_model,d.title "
+                          "FROM jobs j LEFT JOIN documents d ON d.id=j.doc_id "
                           "ORDER BY CASE j.status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, "
                           "CASE WHEN j.status='pending' THEN j.priority END, "
                           "CASE WHEN j.status NOT IN ('running','pending') THEN j.updated_at END DESC,j.created_at,j.rowid")]
 
 
-def update_pending(job_id: str, *, model: str | None = None, move_first: bool = False, remove: bool = False) -> None:
+def _validate_model(kind: str, model: str | None) -> str | None:
     from axiom.orchestration import models
-    with db.connect() as c:
-        if not c.execute("UPDATE jobs SET id=id WHERE id=? AND status='pending'", (job_id,)).rowcount:
+    if kind not in _GROUP_OF_KIND:
+        raise ValueError("This job does not use a model")
+    model = None if model in (None, "auto", "") else model
+    if kind == "cover" and (not model or not model.startswith("codex:")):
+        raise ValueError("Cover jobs require Codex")
+    if model and not any(m["id"] == model and (kind != "transcribe" or m["vision"]) for m in models.catalog()):
+        raise ValueError("Unknown or incompatible model")
+    return model
+
+
+def _release_section(c, job, cancelled: bool = False) -> None:
+    if job["kind"] not in _PIPELINE_STAGES:
+        return
+    target = job["target_id"]
+    c.execute("UPDATE sections SET status='pending' WHERE id=? AND status='running' AND NOT EXISTS "
+              "(SELECT 1 FROM jobs WHERE target_id=? AND status='running' AND kind IN ('transcribe','optimize','verify'))",
+              (target, target))
+    if cancelled and job["kind"] == "verify":
+        c.execute("UPDATE sections SET status='partial' WHERE id=? AND stage='optimized' AND status='done'", (target,))
+
+
+def _cancel_row(c, job, reason: str) -> None:
+    c.execute("UPDATE jobs SET status='cancelled',error=?,updated_at=?,worker=NULL,run_token=NULL,"
+              "requested_action=NULL,restart_model=NULL WHERE id=?", (reason, _now(), job["id"]))
+    _release_section(c, job, cancelled=True)
+
+
+def _cancel_tree(c, job, reason: str) -> None:
+    # Keep tombstones, so ordering-only dependencies can proceed without inheriting failure.
+    cancelled = {job["id"]}
+    pending = c.execute("SELECT * FROM jobs WHERE doc_id=? AND status='pending'", (job["doc_id"],)).fetchall()
+    while True:
+        more = {r["id"] for r in pending if cancelled.intersection(json.loads(r["depends_on"]))}
+        if more <= cancelled:
+            break
+        cancelled.update(more)
+    _cancel_row(c, job, reason)
+    for row in pending:
+        if row["id"] in cancelled and row["id"] != job["id"]:
+            _cancel_row(c, row, "Required job was cancelled")
+
+
+def _apply_request(c, row) -> bool:
+    if row["requested_action"] == "abort":
+        _cancel_tree(c, row, "Aborted by user")
+    elif row["requested_action"] == "restart":
+        c.execute("UPDATE jobs SET status='pending', model=restart_model, attempts=0, worker=NULL, run_token=NULL, "
+                  "error=NULL, progress='{}', requested_action=NULL, restart_model=NULL, updated_at=? WHERE id=?",
+                  (_now(), row["id"]))
+        _release_section(c, row)
+    else:
+        return False
+    return True
+
+
+def request_running(job_id: str, action: str, model: str | None = None) -> None:
+    if action not in ("abort", "restart"):
+        raise ValueError("Unknown job action")
+    with db.connect(immediate=True) as c:
+        row = c.execute("SELECT * FROM jobs WHERE id=? AND status='running'", (job_id,)).fetchone()
+        if not row or row["requested_action"]:
+            raise ValueError("Job is no longer running or already has a pending action; refresh the queue.")
+        if action == "restart":
+            model = _validate_model(row["kind"], model)
+            if model == row["model"]:
+                raise ValueError("Select a different model to restart this job")
+        c.execute("UPDATE jobs SET requested_action=?, restart_model=?, updated_at=? WHERE id=?",
+                  (action, model, _now(), job_id))
+
+
+def update_pending(job_id: str, *, model: str | None = None, move_first: bool = False, remove: bool = False) -> None:
+    with db.connect(immediate=True) as c:
+        job = c.execute("SELECT * FROM jobs WHERE id=? AND status='pending'", (job_id,)).fetchone()
+        if not job:
             raise ValueError("Only waiting jobs can be changed; refresh the queue.")
-        job = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if remove:
-            # Keep tombstones so ordering-only dependencies can proceed; cancel hard descendants atomically.
-            cancelled = {job_id}
-            pending = c.execute("SELECT id,depends_on,target_id,kind FROM jobs WHERE doc_id=? AND status='pending'",
-                                (job["doc_id"],)).fetchall()
-            while True:
-                more = {r["id"] for r in pending if cancelled.intersection(json.loads(r["depends_on"]))}
-                if more <= cancelled:
-                    break
-                cancelled.update(more)
-            for r in pending:
-                if r["id"] not in cancelled:
-                    continue
-                c.execute("UPDATE jobs SET status='cancelled',error='Removed from queue',updated_at=? WHERE id=?",
-                          (_now(), r["id"]))
-                if r["kind"] in ('transcribe', 'optimize', 'verify'):
-                    c.execute("UPDATE sections SET status='pending' WHERE id=? AND status='running' AND NOT EXISTS "
-                              "(SELECT 1 FROM jobs WHERE target_id=? AND status='running' "
-                              "AND kind IN ('transcribe','optimize','verify'))", (r["target_id"], r["target_id"]))
-                if r["kind"] == "verify":  # keep it readable, but invite re-processing to finish verification
-                    c.execute("UPDATE sections SET status='partial' WHERE id=? AND stage='optimized' AND status='done'",
-                              (r["target_id"],))
+            _cancel_tree(c, job, "Removed from queue")
         elif move_first:
             c.execute("UPDATE jobs SET priority=(SELECT MIN(priority)-1 FROM jobs WHERE status='pending'),"
                       "updated_at=? WHERE id=?", (_now(), job_id))
         else:
-            group = _GROUP_OF_KIND.get(job["kind"])
-            if not group:
-                raise ValueError("This job does not use a model")
-            model = None if model in (None, "auto", "") else model
-            if job["kind"] == "cover" and (not model or not model.startswith("codex:")):
-                raise ValueError("Cover jobs require Codex")
-            if model and not any(m["id"] == model and (group != "transcribe" or m["vision"])
-                                 for m in models.catalog()):
-                raise ValueError("Unknown or incompatible model")
+            model = _validate_model(job["kind"], model)
             c.execute("UPDATE jobs SET model=?,updated_at=? WHERE id=?", (model, _now(), job_id))
 
 MAX_DIAGRAMS_PER_SECTION = 2
@@ -348,7 +402,7 @@ def can_run(job, selected: str = "auto") -> bool:
     if not group:
         return True  # import / extract need no model
     from axiom.orchestration import models
-    need = job["model"] if "model" in job.keys() and job["model"] else models.resolve(group).model
+    need = job["model"] if "model" in job.keys() and job["model"] else models.resolve(group, profile=job["profile"]).model
     return models.available("local" if need in ("local_text", "local_vlm") else need)
 
 
@@ -380,27 +434,34 @@ def _claim(kinds: tuple[str, ...], parallel_only: bool = False) -> dict | None:
                           (j["target_id"],))
                 continue
             if all(d in done for d in deps) and can_run(j, selected):
-                c.execute("UPDATE jobs SET status='running', attempts=attempts+1, worker=?, updated_at=? WHERE id=?",
-                          (WORKER_NAME, _now(), j["id"]))
-                return dict(j)
+                token = uuid.uuid4().hex
+                c.execute("UPDATE jobs SET status='running', attempts=attempts+1, worker=?, run_token=?, updated_at=? WHERE id=?",
+                          (WORKER_NAME, token, _now(), j["id"]))
+                return dict(j, run_token=token)
     return None
 
 
 def _run(job: dict) -> None:
-    from axiom.extraction.extract import extract_chapter
-    from axiom.orchestration.pipeline import optimize_and_verify
-    from axiom.transformations.transcribe import transcribe_section
+    from axiom.orchestration import llm, models
 
     def should_stop():
-        return _stop.is_set() or job["id"] in _cancel_requested
+        if _stop.is_set():
+            return True
+        row = db.q1("SELECT run_token,requested_action FROM jobs WHERE id=?", (job["id"],))
+        return not row or row["run_token"] != job.get("run_token") or bool(row["requested_action"])
 
-    kind, target, profile = job["kind"], job["target_id"], job["profile"]
-    from axiom.orchestration import models
-    token = models.processing_model.set(job.get("model"))  # the model chosen for this processing run
+    def checkpoint():
+        if should_stop():
+            raise InterruptedError("Job interrupted")
+
+    token = models.processing_model.set(job.get("model"))
     ptoken = models.processing_parallel.set(bool(job.get("parallel")))
+    stop_token = llm.job_checkpoint.set(checkpoint)
     try:
-        _run_kind(job, kind, target, profile, should_stop)
+        checkpoint()
+        _run_kind(job, job["kind"], job["target_id"], job["profile"], should_stop)
     finally:
+        llm.job_checkpoint.reset(stop_token)
         models.processing_parallel.reset(ptoken)
         models.processing_model.reset(token)
 
@@ -438,9 +499,29 @@ def _run_kind(job: dict, kind: str, target: str, profile: str, should_stop) -> N
         result = generate(target, job["model"])
     else:
         raise ValueError(f"unknown job kind {kind}")
-    with db.connect() as c:
-        c.execute("UPDATE jobs SET status='done', progress=?, error=NULL, updated_at=? WHERE id=?",
-                  (json.dumps(result), _now(), job["id"]))
+    _finish(job, result=result)
+
+
+def _finish(job, *, result=None, error: str | None = None, interrupted: bool = False) -> None:
+    with db.connect(immediate=True) as c:
+        row = c.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+        if not row or row["run_token"] != job.get("run_token") or row["status"] not in ("running", "pending"):
+            return  # this attempt lost ownership (e.g. its worker disconnected)
+        if _apply_request(c, row):
+            return
+        if interrupted:
+            c.execute("UPDATE jobs SET status='pending', attempts=MAX(0,attempts-1), worker=NULL,run_token=NULL,updated_at=? "
+                      "WHERE id=?", (_now(), job["id"]))
+            _release_section(c, row)
+        elif error is not None:
+            status = "failed" if row["attempts"] >= row["max_attempts"] else "pending"
+            c.execute("UPDATE jobs SET status=?,error=?,worker=NULL,run_token=NULL,updated_at=? WHERE id=?",
+                      (status, error, _now(), job["id"]))
+            if status == "failed" and job["kind"] in _PIPELINE_STAGES:
+                c.execute("UPDATE sections SET status='failed' WHERE id=?", (job["target_id"],))
+        else:
+            c.execute("UPDATE jobs SET status='done',progress=?,error=NULL,run_token=NULL,updated_at=? WHERE id=?",
+                      (json.dumps(result), _now(), job["id"]))
 
 
 def _worker(kinds: tuple[str, ...], idle_exit: bool, parallel_only: bool = False) -> None:
@@ -455,18 +536,10 @@ def _worker(kinds: tuple[str, ...], idle_exit: bool, parallel_only: bool = False
         try:
             _run(job)
         except InterruptedError:
-            st = "cancelled" if job["id"] in _cancel_requested else "pending"
-            with db.connect() as c:
-                c.execute("UPDATE jobs SET status=?, updated_at=? WHERE id=?", (st, _now(), job["id"]))
+            _finish(job, interrupted=True)
         except Exception as e:
             log.error("job %s failed: %s", job["id"], e)
-            with db.connect() as c:
-                row = c.execute("SELECT attempts, max_attempts FROM jobs WHERE id=?", (job["id"],)).fetchone()
-                st = "failed" if row["attempts"] >= row["max_attempts"] else "pending"
-                c.execute("UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
-                          (st, f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}", _now(), job["id"]))
-                if st == "failed" and job["kind"] in ("transcribe", "optimize", "verify"):
-                    c.execute("UPDATE sections SET status='failed' WHERE id=?", (job["target_id"],))
+            _finish(job, error=f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}")
 
 
 def start_workers(n_transcribe: int = 1, n_optimize: int | None = None, idle_exit: bool = False) -> list[threading.Thread]:

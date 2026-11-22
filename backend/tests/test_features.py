@@ -502,13 +502,13 @@ def test_study_deck_keeps_reviewed_figure_and_packages_media(tmp_db, fake, tmp_p
     assert jobs.enqueue_anki("d", regenerate=True) != [jid]
 
 
-def test_study_deck_spreads_caps_across_sections_and_chapters(tmp_db, monkeypatch):
+def test_study_deck_spreads_caps_across_sections_and_chapters(tmp_db):
     from axiom.anki import study
     _section([])
-    monkeypatch.setattr(study, "PER_BOOK", 3)
-    monkeypatch.setattr(study, "PER_CHAPTER", 2)
     with db.connect() as c:
-        c.execute("INSERT INTO chapters(id,doc_id,number,title,page_start,page_end) VALUES ('d-c2','d',2,'C',2,3)")
+        c.execute("UPDATE documents SET page_count=5")
+        c.execute("UPDATE chapters SET page_end=3")
+        c.execute("INSERT INTO chapters(id,doc_id,number,title,page_start,page_end) VALUES ('d-c2','d',2,'C',3,5)")
         for i, ch in ((1, 1), (2, 1), (3, 2)):
             sid = f"s{i}"
             c.execute("INSERT INTO sections(id,doc_id,chapter_id,ord,number,title,page_start,page_end,stage) "
@@ -517,3 +517,100 @@ def test_study_deck_spreads_caps_across_sections_and_chapters(tmp_db, monkeypatc
             c.execute("INSERT INTO study_cards VALUES (?,?)", (sid, json.dumps(cards)))
     assert [c["guid"] for c in study.build_cards("d")] == ["s1-0", "s2-0", "s3-0"]
     assert [c["guid"] for c in study.build_cards("d", [2])] == ["s3-0", "s3-1"]
+    with db.connect() as c:
+        c.execute("UPDATE documents SET page_count=501")
+        c.execute("UPDATE chapters SET page_end=501 WHERE number=2")
+        c.execute("UPDATE study_cards SET data=? WHERE section_id='s3'", (json.dumps([
+            dict(guid=f"long-{i}", front=f"Long chapter question {i}") for i in range(260)
+        ]),))
+    assert len(study.build_cards("d")) == 251
+    assert len(study.build_cards("d", [2])) == 250
+    with db.connect() as c:
+        c.execute("UPDATE chapters SET page_end=page_start WHERE number=2")
+    assert len(study.build_cards("d", [2])) == 1  # inclusive single-page span
+
+
+def test_long_study_section_can_generate_more_than_three_cards(tmp_db, fake):
+    from axiom.anki import study
+    blocks = [("paragraph", f"Verified source demonstration {i}") for i in range(12)]
+    units = [dict(_unit(text, [f"b{i}"]), verification={"status": "verified"}) for i, (_, text) in enumerate(blocks)]
+    _section(blocks, units)
+    with db.connect() as c:
+        c.execute("UPDATE documents SET page_count=16")
+        c.execute("UPDATE chapters SET page_end=16")
+        c.execute("UPDATE sections SET page_end=16,stage='verified'")
+
+    def draft(req):
+        evidence = json.loads(req.user_text)["units"]
+        return {"cards": [dict(kind="derivation", question=f"How would you justify {evidence[key]}?",
+                               answer="Use the stated physical principles to derive the result.", sources=[key])
+                          for key in list(evidence)[:3]]}
+
+    fake({"Generate zero to three": draft, "Audit these candidate": lambda _: {"checks": "Grounded", "keep": [0, 1, 2]}})
+    assert study.generate("d-s1.1", "local")["cards"] == 6
+    cards = study.build_cards("d")
+    assert len(cards) == 6 and "demonstration 6" in cards[1]["front"]
+
+
+def test_running_anki_restart_switches_model_at_checkpoint(tmp_db, fake, monkeypatch):
+    from fastapi.testclient import TestClient
+    from axiom.api.app import create_app
+    from axiom.orchestration import jobs, models
+    unit = _unit("The light cone divides spacetime into causal regions.", ["b0"])
+    unit["verification"] = {"status": "verified"}
+    _section([("paragraph", "light cone")], [unit])
+    with db.connect() as c:
+        c.execute("UPDATE sections SET stage='verified'")
+    monkeypatch.setattr(models, "available", lambda _: True)
+    with TestClient(create_app(start_worker=False)) as client:
+        url = "/api/documents/d/anki/generate"
+        assert client.post(url, json={"model": "unknown"}).status_code == 400
+        jid, = client.post(url, json={"model": "local"}).json()["job_ids"]
+        old = jobs._claim(("anki",))
+        assert old["model"] == "local"
+        def request_restart(_):
+            assert client.patch(f"/api/jobs/{jid}", json={"action": "restart", "model": "local"}).status_code == 409
+            assert client.patch(f"/api/jobs/{jid}", json={"action": "restart", "model": "codex:default"}).status_code == 204
+            row = client.get("/api/jobs").json()["jobs"][0]
+            assert (row["model"], row["requested_action"], row["restart_model"]) == ("local", "restart", "codex:default")
+            assert jobs._claim(("anki",)) is None
+            return {"cards": []}
+        fake({"Generate zero to three": request_restart})
+        with pytest.raises(InterruptedError):
+            jobs._run(old)
+        assert not db.q("SELECT * FROM study_cards")
+        jobs._finish(old, interrupted=True)
+        new = jobs._claim(("anki",))
+        assert new["id"] == jid and new["model"] == "codex:default" and new["attempts"] == 0
+        jobs._finish(old, result={"stale": True})
+        assert db.q1("SELECT status FROM jobs WHERE id=?", (jid,))["status"] == "running"
+        codex = fake({"Generate zero to three": lambda _: {"cards": []}}, cls="codex:default")
+        jobs._run(new)
+        assert len(codex.calls) == 1 and db.q1("SELECT status FROM jobs WHERE id=?", (jid,))["status"] == "done"
+
+
+def test_running_abort_survives_worker_disconnect(tmp_db, monkeypatch):
+    from fastapi.testclient import TestClient
+    from axiom.api.app import create_app
+    from axiom.api.internal import _release_jobs
+    from axiom.orchestration import jobs, models
+    _section([])
+    monkeypatch.setattr(models, "available", lambda _: True)
+    monkeypatch.setattr(jobs, "WORKER_NAME", "pc")
+    extract, transcribe, optimize, verify, reconcile = jobs.enqueue_document("d", [1], parallel=True, model="claude-code:sonnet")
+    attempt = jobs._claim(("extract",))
+    assert attempt["id"] == extract
+    with TestClient(create_app(start_worker=False)) as client:
+        assert client.patch(f"/api/jobs/{extract}", json={"action": "restart", "model": "local"}).status_code == 409
+        assert client.patch(f"/api/jobs/{extract}", json={"action": "abort"}).status_code == 204
+    assert _release_jobs("other") == 0
+    assert _release_jobs("pc") == 1
+    states = {r["id"]: r["status"] for r in jobs.queue_snapshot()}
+    assert all(states[jid] == "cancelled" for jid in (extract, transcribe, optimize, verify))
+    claimed = jobs._claim(("reconcile",))
+    assert claimed["id"] == reconcile  # soft dependencies survive cancellation
+    jobs.request_running(reconcile, "restart", "local")
+    assert _release_jobs("pc") == 1
+    restarted = jobs._claim(("reconcile",))
+    assert restarted["id"] == reconcile and restarted["model"] == "local"
+    assert restarted["run_token"] != claimed["run_token"]

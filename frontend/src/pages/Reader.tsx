@@ -23,6 +23,7 @@ const WIDTHS: { w: Width; label: string }[] = [
   { w: "wide", label: "Wide" },
 ];
 import { exKey, load, loadPosition, savePosition, type ExerciseMark } from "../lib/storage";
+import { loadReading, recordReading, visibleReading } from "../lib/reading";
 
 const LEVELS: { level: Level; label: string; hint: string }[] = [
   { level: 1, label: "Fast Track", hint: "Essentials only, condensed (key 1)" },
@@ -249,6 +250,14 @@ export function Reader() {
         raf = 0;
         const root = mainRef.current;
         if (!root) return;
+        const docId = sectionsRef.current[0]?.document_id;
+        const updates: Record<string, number> = {};
+        for (const text of root.querySelectorAll<HTMLElement>("[data-reading-section]")) {
+          const { top, bottom } = text.getBoundingClientRect();
+          const percent = visibleReading(top, bottom, window.innerHeight);
+          if (percent !== null) updates[text.dataset.readingSection!] = percent;
+        }
+        if (docId && Object.keys(updates).length) recordReading(docId, updates);
         const els = Array.from(root.querySelectorAll<HTMLElement>("[data-unit-id]"));
         const i = topmostIndex(els);
         if (i < 0) return;
@@ -273,6 +282,11 @@ export function Reader() {
       if (raf) cancelAnimationFrame(raf);
     };
   }, []);
+
+  useEffect(() => {
+    const opened = sections.find((s) => s.id === sectionId);
+    if (opened && !opened.is_exercises && opened.units.length) recordReading(opened.document_id, { [opened.id]: 0 });
+  }, [sectionId, sections]);
 
   // ---- continuous scroll: lazily append following sections of the same chapter ----
   const last = sections[sections.length - 1];
@@ -676,6 +690,7 @@ function useRelatedExercises(docId: string, sectionId: string, enabled: boolean)
 function SectionBlock({ section, level }: { section: SectionView; level: Level }) {
   const units = useMemo(() => section.units.filter((u) => u.min_level <= level), [section.units, level]);
   const hidden = section.units.length - units.length;
+  const [marked, setMarked] = useState(() => loadReading(section.document_id)[section.id] === 100);
   const { exerciseFirst } = usePrefs();
   const tryFirst = useRelatedExercises(section.document_id, section.id, exerciseFirst && section.exercises.length === 0);
   return (
@@ -711,10 +726,17 @@ function SectionBlock({ section, level }: { section: SectionView; level: Level }
           </ul>
         </div>
       )}
-      {section.summary_md && <SectionSummary md={section.summary_md} />}
-      {units.map((u) => (
-        <UnitView key={u.id} unit={u} level={level} sectionId={section.id} />
-      ))}
+      <div data-reading-section={!section.is_exercises && units.length ? section.id : undefined}>
+        {section.summary_md && <SectionSummary md={section.summary_md} />}
+        {units.map((u) => (
+          <UnitView key={u.id} unit={u} level={level} sectionId={section.id} />
+        ))}
+      </div>
+      {!section.is_exercises && units.length > 0 && <button type="button" className="link-btn small muted"
+        disabled={marked} onClick={() => {
+          recordReading(section.document_id, { [section.id]: 100 });
+          setMarked(true);
+        }}>{marked ? "Marked as read" : "Mark section as read"}</button>}
       {hidden > 0 && (
         <p className="hidden-note muted small">
           {hidden} passage{hidden === 1 ? "" : "s"} hidden at this level.

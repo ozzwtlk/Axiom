@@ -159,7 +159,8 @@ def _transcribe_one(b, doc_id: str, section_id: str, profile: str) -> tuple[str,
                 md = md2
         md = _repair_math(md)
         if b["block_type"] == "equation" and not b["eq_number"] and looks_like_prose(md):
-            with db.connect() as c:  # segmentation error corrected by transcription evidence
+            with db.connect(immediate=True) as c:  # segmentation error corrected by transcription evidence
+                llm.check_job()
                 c.execute("UPDATE blocks SET block_type='paragraph' WHERE id=?", (b["id"],))
             b = {**dict(b), "block_type": "paragraph"}
         conf, flags = assess(b, md)
@@ -169,7 +170,8 @@ def _transcribe_one(b, doc_id: str, section_id: str, profile: str) -> tuple[str,
 
 
 def _save(b, section_id, doc_id, md, method, conf, flags):
-    with db.connect() as c:
+    with db.connect(immediate=True) as c:
+        llm.check_job()
         c.execute("UPDATE blocks SET transcribed_md=?, transcription_method=?, confidence=?, flags=? WHERE id=?",
                   (md, method, conf, db.jdump(flags), b["id"]))
         c.execute("DELETE FROM search_fts WHERE block_id=?", (b["id"],))
@@ -204,6 +206,8 @@ def transcribe_section(section_id: str, profile: str = "economy", should_stop=la
         for method, cached in ex.map(lambda b: ctx.copy().run(work, b), todo):
             stats["vision" if method == "vision_ocr" else "text_layer"] += 1
             stats["cached"] += int(cached)
+    if should_stop():
+        raise InterruptedError("cancelled")
     # block-level quality control before the optimizer sees the text (page numbers, text cut out as images,
     # lines caught twice); regions that turned out to be text are read once more
     from axiom.verification import quality

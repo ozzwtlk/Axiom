@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { listDocuments, listImports, MOCK, removeDocument, uploadDocument } from "../api/client";
-import { StatusBadge } from "../components/StatusBadge";
+import { ProcessedCheck, ReadingPercent, ReadingStatus } from "../components/ReadingStatus";
+import { loadReading, summarizeReading } from "../lib/reading";
+import { loadPosition } from "../lib/storage";
 import type { DocumentSummary, PendingImport } from "../api/types";
 import { Cover } from "./DocumentPage";
 
@@ -70,25 +72,34 @@ export function Library() {
       {docs === null && !err && <p className="muted">Loading…</p>}
       {docs && (
         <div className="lib-grid">
-          {docs.map((d) => (
-            <article key={d.id} className="book-entry">
+          {docs.map((d) => {
+            const ids = d.reading_section_ids ?? [];
+            const progress = loadReading(d.id);
+            const pos = loadPosition(d.id);
+            if (pos) progress[pos.sectionId] ??= 0;
+            const reading = summarizeReading(ids, progress);
+            return <article key={d.id} className="book-entry">
               <Link to={`/doc/${d.id}`} className="book-card">
                 <Cover docId={d.id} title={d.title} revision={d.cover_revision} />
                 <div className="book-title">{d.title}</div>
                 <div className="book-meta">
                   {d.chapters_done} of {d.chapters_total} chapters ready · {d.page_count} pages
-                  {d.completed && <> · <StatusBadge status="done" /></>}
+                  {d.completed && <> · <ProcessedCheck /></>}
                 </div>
                 <div className="bar" aria-label={`${d.chapters_done} of ${d.chapters_total} chapters processed`}>
                   <div style={{ width: `${d.chapters_total ? (100 * d.chapters_done) / d.chapters_total : 0}%` }} />
                 </div>
+                {!!ids.length && <div className="reading-line">
+                  <ReadingPercent percent={reading.percent} />
+                  {reading.touched && <ReadingStatus finished={reading.finished} />}
+                </div>}
               </Link>
               {!MOCK && <button type="button" className="link-btn small book-remove" disabled={removing !== null}
                                 aria-label={`Remove ${d.title}`} onClick={() => onRemove(d)}>
                 {removing === d.id ? "Removing…" : "Remove"}
               </button>}
-            </article>
-          ))}
+            </article>;
+          })}
           {imports.map((im) => (
             <div key={im.id} className="book-card pending-import">
               <div className="book-cover">

@@ -56,7 +56,7 @@ class ModelChoice(BaseModel):
 
 
 class JobUpdate(BaseModel):
-    action: Literal["model", "move_first"]
+    action: Literal["model", "move_first", "abort", "restart"]
     model: str | None = None
 
 
@@ -111,10 +111,12 @@ def _doc_summary(d) -> DocumentSummary:
         status = _chapter_status(st)
         verified += int(status == "done" and all(s["stage"] == "verified" for s in secs))
         done += int(status == "done" or bool(st and all(s in ("done", "partial") for s in st)))
+    reading = db.q("SELECT id FROM sections WHERE doc_id=? AND is_exercises=0 AND NOT EXISTS "
+                   "(SELECT 1 FROM meta WHERE key='empty:' || sections.id)", (d["id"],))
     cover = db.q1("SELECT revision FROM covers WHERE doc_id=?", (d["id"],))
     return DocumentSummary(id=d["id"], title=d["title"], page_count=d["page_count"], created_at=d["created_at"],
                            chapters_total=len(chs), chapters_done=done, completed=bool(chs) and verified == len(chs),
-                           cover_revision=cover["revision"] if cover else None)
+                           cover_revision=cover["revision"] if cover else None, reading_section_ids=[s["id"] for s in reading])
 
 
 def _unit(u: dict) -> Unit:
@@ -368,7 +370,11 @@ def create_app(start_worker: bool = True) -> FastAPI:
     def update_job(job_id: str, body: JobUpdate):
         from axiom.orchestration.jobs import update_pending
         try:
-            update_pending(job_id, model=body.model, move_first=body.action == "move_first")
+            if body.action in ("abort", "restart"):
+                from axiom.orchestration.jobs import request_running
+                request_running(job_id, body.action, body.model)
+            else:
+                update_pending(job_id, model=body.model, move_first=body.action == "move_first")
         except ValueError as e:
             raise HTTPException(409, str(e))
         return Response(status_code=204)
@@ -430,6 +436,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
         return SectionView(id=s["id"], document_id=s["doc_id"], chapter_number=s["chapter_number"], number=s["number"],
                            title=s["title"], status=s["status"], summary_md=s["digest_md"] or s["summary_md"],
                            verified=s["stage"] == "verified" and bool(units), units=units, exercises=exercises,
+                           is_exercises=bool(s["is_exercises"]),
                            prev_section_id=ids[i - 1] if i > 0 else None,
                            next_section_id=ids[i + 1] if i + 1 < len(ids) else None)
 
@@ -542,12 +549,14 @@ def create_app(start_worker: bool = True) -> FastAPI:
         return hits
 
     @app.post("/api/documents/{doc_id}/anki/generate")
-    def anki_generate(doc_id: str, regenerate: bool = False):
+    def anki_generate(doc_id: str, regenerate: bool = False, body: ModelChoice | None = None):
         from axiom.orchestration.jobs import enqueue_anki
         try:
-            return {"job_ids": enqueue_anki(doc_id, regenerate)}
+            return {"job_ids": enqueue_anki(doc_id, regenerate, body.model if body else None)}
         except KeyError:
             raise HTTPException(404, "document not found")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
 
     @app.get("/api/documents/{doc_id}/anki")
     def anki_export(doc_id: str, deck: str = "AXIOM", chapters: str | None = None,

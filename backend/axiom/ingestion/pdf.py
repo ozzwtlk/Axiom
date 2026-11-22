@@ -247,6 +247,47 @@ def _starts_before(page: int, y, spage: int, sy) -> bool:
     return y is not None and sy is not None and sy - y > 90
 
 
+def read_structure(pdf: pymupdf.Document) -> list[OutlineChapter]:
+    outline = parse_outline(pdf.get_toc(False), pdf.page_count, pdf)
+    if len(outline) > 1:
+        return outline
+    from axiom.ingestion.contents import printed_contents
+
+    chapters: list[OutlineChapter] = []
+    by_number: dict[int, OutlineChapter] = {}
+    end = pdf.page_count
+    for entry, page, y in printed_contents(pdf):
+        if not entry.number:
+            end = page - 1
+            break
+        parent, _, child = entry.number.partition(".")
+        number = int(parent)
+        if child:
+            chapter = by_number.get(number)
+            if chapter is None:
+                # Some notes start their contents at 1.1 without a separate chapter heading.
+                chapter = OutlineChapter(number, f"Chapter {number}", page, end, [], y)
+                chapters.append(chapter)
+                by_number[number] = chapter
+            chapter.sections.append(OutlineSection(entry.number, _smart_title(entry.title), page, start_y=y))
+        elif number not in by_number:
+            chapter = OutlineChapter(number, _smart_title(entry.title), page, end, [], y)
+            chapters.append(chapter)
+            by_number[number] = chapter
+    if sum(max(1, len(c.sections)) for c in chapters) < 2:
+        return outline
+    if any(a.page_start >= b.page_start for a, b in zip(chapters, chapters[1:])):
+        return outline  # extraction currently assigns a physical page to one chapter
+    for i, ch in enumerate(chapters):
+        ch.page_end = max(ch.page_start, chapters[i + 1].page_start - 1 if i + 1 < len(chapters) else end)
+        ch.sections = [s for s in ch.sections if ch.page_start <= s.page_start <= ch.page_end]
+        if not ch.sections or _starts_before(ch.page_start, ch.start_y, ch.sections[0].page_start, ch.sections[0].start_y):
+            ch.sections.insert(0, OutlineSection(f"{ch.number}.0", ch.title, ch.page_start, start_y=ch.start_y))
+        for j, sec in enumerate(ch.sections):
+            sec.page_end = ch.sections[j + 1].page_start if j + 1 < len(ch.sections) else ch.page_end
+    return chapters
+
+
 def is_scanned(pdf: pymupdf.Document, samples: int = 12) -> bool:
     """A page is 'scanned' if one image covers ~the whole page (the text layer is then OCR, whose math -- and
     Greek letters inside prose -- cannot be trusted)."""
@@ -281,8 +322,8 @@ def import_pdf(src: Path, title: str | None = None) -> str:
     pdf = pymupdf.open(dst)
     meta_title = (pdf.metadata or {}).get("title") or ""
     doc_title = title or meta_title or src.stem
-    chapters = parse_outline(pdf.get_toc(False), pdf.page_count, pdf)
-    if not chapters:  # no usable outline: single chapter, single section (documented limitation)
+    chapters = read_structure(pdf)
+    if not chapters:  # neither bookmarks nor a reliable printed contents table
         chapters = [OutlineChapter(1, doc_title, 1, pdf.page_count,
                                    [OutlineSection("1.0", doc_title, 1, pdf.page_count)])]
     now = datetime.now(timezone.utc).isoformat()
@@ -319,7 +360,7 @@ def restructure(doc_id: str, force: bool = False) -> dict:
     if n_blocks and not force:
         raise RuntimeError(f"{n_blocks} blocks were already extracted; pass force to discard them")
     pdf = open_pdf(doc_id)
-    chapters = parse_outline(pdf.get_toc(False), pdf.page_count, pdf)
+    chapters = read_structure(pdf)
     if not chapters:
         return {"chapters": 0, "changed": False}
     with db.connect(immediate=True) as c:
