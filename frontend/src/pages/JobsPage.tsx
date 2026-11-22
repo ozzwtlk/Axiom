@@ -45,6 +45,8 @@ export function JobsPage() {
       return id.startsWith("~") ? job?.status === "running" || job?.status === "pending" : job?.status !== "done";
     });
     const choices = (report?.models ?? []).filter((m) => j.kind === "cover" ? m.id.startsWith("codex:") : j.kind !== "transcribe" || m.vision);
+    const showLocal = j.kind !== "cover" && !choices.some((m) => m.id === "local");
+    const hasAlternative = choices.some((m) => m.id !== j.model) || (j.kind !== "cover" && (!!j.model || showLocal));
     return <li className="card queue-job" key={j.id}>
       <div>
         <strong>{i !== undefined && `${i + 1}. `}{j.kind}</strong> · {j.status}
@@ -59,7 +61,34 @@ export function JobsPage() {
           Depends on {blocked.map((dep) => dep.startsWith("~") ? `${dep.slice(1)} (order only)` : dep).join(", ")}
         </div>}
         {j.error && <p className="small error">{j.error.split("\n")[0]}</p>}
+        {j.requested_action && <p className="small muted" role="status">
+          {j.requested_action === "abort" ? "Abort requested" : `Restart requested · ${j.restart_model ?? "AI model settings"}`}. Waiting for a safe checkpoint.
+        </p>}
       </div>
+      {j.status === "running" && !j.requested_action && <div className="queue-actions">
+        {j.model_group && hasAlternative && <form className="queue-actions" onSubmit={(event) => {
+          event.preventDefault();
+          const model = new FormData(event.currentTarget).get("model");
+          if (typeof model === "string") void action(j.id, () => changeJob(j.id, { action: "restart", model }));
+        }}>
+          <label className="field small">Restart model for {j.id}
+            <select name="model" defaultValue="" required disabled={busy !== null}>
+              <option value="" disabled>Choose a different model</option>
+              {j.kind !== "cover" && j.model && <option value="auto">AI model settings</option>}
+              {showLocal && j.model !== "local" && <option value="local">Local model</option>}
+              {choices.filter((m) => m.id !== j.model).map((m) => <option key={m.id} value={m.id}>
+                {m.label}{m.available ? "" : " (offline)"}
+              </option>)}
+            </select>
+          </label>
+          <button type="submit" className="btn btn-sm btn-quiet" disabled={busy !== null}>Restart</button>
+        </form>}
+        <button type="button" className="link-btn small" disabled={busy !== null} onClick={() => {
+          if (window.confirm("Abort this job and cancel any waiting jobs that require its output? Completed work is kept.")) {
+            void action(j.id, () => changeJob(j.id, { action: "abort" }));
+          }
+        }}>Abort</button>
+      </div>}
       {j.status === "pending" && <div className="queue-actions">
         {j.model_group && <label className="field small">Model for {j.id}
           <select value={j.model ?? ""} disabled={busy !== null}

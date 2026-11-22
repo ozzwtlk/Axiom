@@ -30,16 +30,35 @@ await page.goto(BASE + "/", { waitUntil: "networkidle" });
 check("library lists the document", (await page.textContent("body")).includes(doc.title.slice(0, 20)));
 await page.goto(`${BASE}/doc/${doc.id}`, { waitUntil: "networkidle" });
 check("document page shows chapters", (await page.locator(".chapter").count()) === doc.chapters.length);
+check("untouched book has no reading status", (await page.locator(".reading-status").count()) === 0);
 const cards = await api(`/documents/${doc.id}/anki?format=json`);
 check("study tools: generate or export", cards.length
   ? (await page.getByRole("link", { name: "Download .apkg" }).count()) === 1
   : (await page.getByRole("button", { name: /Generate study cards|sections queued or running/ }).count()) === 1);
+check("study tools: model picker", (await page.getByRole("combobox", { name: "Model for Anki generation" }).count()) === 1);
 check("book offers a Codex-generated cover", (await page.getByRole("button", { name: /cover with Codex|Cover queued/ }).count()) === 1);
 check("chapter exam link", (await page.locator('a:has-text("exam")').count()) >= 1);
 
 await page.getByRole("link", { name: "Jobs", exact: true }).click();
 await page.getByRole("heading", { name: /^Waiting/ }).waitFor();
 check("jobs tab shows queue and running work", (await page.getByRole("heading", { name: /^Running/ }).count()) === 1);
+let requested;
+await page.route("**/api/jobs", (route) => route.fulfill({ json: { jobs: [{
+  id: "smoke-job", doc_id: doc.id, title: doc.title, kind: "anki", target_id: reading.id,
+  status: "running", depends_on: [], model: "local", model_group: "anki", priority: 0,
+  parallel: 0, worker: null, error: null, requested_action: requested?.action ?? null,
+  restart_model: requested?.model ?? null,
+}] } }));
+await page.route("**/api/jobs/smoke-job", async (route) => {
+  requested = route.request().postDataJSON();
+  await route.fulfill({ status: 204 });
+});
+await page.getByRole("combobox", { name: "Restart model for smoke-job" }).selectOption("auto");
+await page.getByRole("button", { name: "Restart", exact: true }).click();
+await page.getByText(/Restart requested/).waitFor();
+check("running job can request a model restart", requested?.action === "restart" && requested?.model === "auto");
+await page.unroute("**/api/jobs/smoke-job");
+await page.unroute("**/api/jobs");
 
 // reader: three levels
 await page.goto(`${BASE}/read/${reading.id}`, { waitUntil: "networkidle" });
@@ -58,6 +77,14 @@ if (secView.verified) {
   const n = await page.locator(`[id="sec-${reading.id}"] .checked, [id="sec-${reading.id}"] .flag-reverted, [id="sec-${reading.id}"] .flag-unverified_claim`).count();
   check("faithfulness markers on a verified section", n > 0, `${n} markers`);
   check("'Test yourself' link on a verified section", (await page.locator('a:has-text("Test yourself")').count()) > 0);
+}
+
+if (doc.reading_section_ids.includes(reading.id)) {
+  await page.locator(`[id="sec-${reading.id}"]`).getByRole("button", { name: /Mar(k section|ked) as read/ }).evaluate((button) => button.click());
+  await page.goto(`${BASE}/doc/${doc.id}`, { waitUntil: "networkidle" });
+  check("reading progress is independent of processing", await page.getByText("100% read", { exact: true }).count() > 0);
+  check("opened book shows its reading status", (await page.locator(".reading-status").textContent()) ===
+    (doc.reading_section_ids.length === 1 ? "Finished reading" : "Still reading"));
 }
 
 // exercises

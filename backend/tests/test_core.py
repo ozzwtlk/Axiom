@@ -400,3 +400,45 @@ def test_lecture_notes_outline_gives_chapters_and_positional_sections(tmp_db, tm
         restructure(doc)
     assert restructure(doc, force=True)["sections"] == 4
     assert not db.q1("SELECT 1 FROM blocks WHERE doc_id=?", (doc,))
+
+
+@pytest.mark.parametrize("flat_bookmark", [False, True])
+def test_import_uses_printed_contents_and_resolves_page_offset(tmp_db, tmp_path, flat_bookmark):
+    import pymupdf
+    from axiom.ingestion.pdf import import_pdf
+    from axiom.storage import db
+    path = tmp_path / "Lecture Notes.pdf"
+    with pymupdf.open() as pdf:
+        for _ in range(8):
+            pdf.new_page()
+        pdf[0].insert_text((65, 80), "Lecture Notes")
+        contents = pdf[1]
+        for n, line in enumerate(("Table of Contents", "1. First Lecture ........ 1", "1.1 A Classical Example ........ 1",
+                                  "1.2 A Quantum Example ........ 1", "2 Second Lecture ........ 4",
+                                  "2.1 Exercises ........ 5", "References ........ 6")):
+            contents.insert_text((65, 80 + 22*n), line)
+        for page, y, heading in ((2, 80, "1 First Lecture"), (2, 135, "1.1 A Classical Example"),
+                                 (2, 340, "1.2 A Quantum Example"), (5, 80, "2 Second Lecture"),
+                                 (6, 105, "2.1 Exercises"), (7, 80, "References")):
+            pdf[page].insert_text((65, y), heading)
+        if flat_bookmark:
+            pdf.set_toc([[1, "Lecture Notes", 1]])
+        pdf.save(path)
+    doc = import_pdf(path)
+    chapters = db.q("SELECT number,page_start,page_end FROM chapters WHERE doc_id=? ORDER BY number", (doc,))
+    assert [tuple(c) for c in chapters] == [(1, 3, 5), (2, 6, 7)]
+    sections = db.q("SELECT number,page_start,start_y,is_exercises FROM sections WHERE doc_id=? ORDER BY chapter_id,ord", (doc,))
+    first, second, *_, exercises = sections
+    assert (first["number"], first["page_start"]) == ("1.1", 3)
+    assert second["number"] == "1.2" and second["start_y"] > first["start_y"]
+    assert exercises["is_exercises"] == 1
+
+
+def test_contents_needs_body_evidence():
+    import pymupdf
+    from axiom.ingestion.pdf import read_structure
+    with pymupdf.open() as pdf:
+        pdf.new_page().insert_text((65, 80), "Contents\n1 First Title .... 2\n2 Second Title .... 3")
+        pdf.new_page()
+        pdf.new_page()
+        assert not read_structure(pdf)

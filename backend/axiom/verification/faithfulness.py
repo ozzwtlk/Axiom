@@ -236,7 +236,8 @@ def verify_section(section_id: str, profile: str = "economy", should_stop=lambda
             st = apply_verdicts(u, by_unit.get(u["id"], []), blocks, meta["model"])
             stats["units_checked"] += 1
             stats[st] += 1
-    with db.connect() as c:
+    with db.connect(immediate=True) as c:
+        llm.check_job()
         for u in units:
             uid_ = u.pop("id")
             c.execute("UPDATE units SET data=? WHERE id=?", (db.jdump(dict(u, id=uid_)), uid_))

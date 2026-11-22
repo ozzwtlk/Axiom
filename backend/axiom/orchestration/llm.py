@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import threading
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -31,6 +32,13 @@ log = logging.getLogger("axiom.llm")
 _adapters: dict[str, ChatAdapter] = {}
 _sems: dict[str, threading.Semaphore] = {}
 _lock = threading.Lock()
+job_checkpoint: ContextVar[Callable[[], None] | None] = ContextVar("job_checkpoint", default=None)
+
+
+def check_job() -> None:
+    checkpoint = job_checkpoint.get()
+    if checkpoint:
+        checkpoint()
 
 
 class BudgetExceeded(RuntimeError):
@@ -151,6 +159,7 @@ def call(task: str, model: "str | models.Route", req: ChatRequest, prompt_versio
                 raise
             log.warning("%s: %s unavailable (%s); falling back to %s", task, model.model, e, model.fallback)
             return call(task, fb, req, prompt_version, doc_id=doc_id, profile=profile, use_cache=use_cache)
+    check_job()
     mid = _canon(model)
     mclass = _metering_class(mid, model)
     ad = get_adapter(mid)
@@ -174,6 +183,7 @@ def call(task: str, model: "str | models.Route", req: ChatRequest, prompt_versio
         raise BudgetExceeded(f"daily limit for {mid} reached ({models.daily_limit(task)} calls); "
                              "raise AXIOM_SUBSCRIPTION_DAILY_LIMIT(_BULK) or wait until tomorrow")
     with _sem(mid):
+        check_job()
         try:
             res = ad.chat(req)
         except Exception:
@@ -190,6 +200,7 @@ def call(task: str, model: "str | models.Route", req: ChatRequest, prompt_versio
                        db.jdump({"text": res.text, "model": res.model, "pt": res.prompt_tokens,
                                  "ct": res.completion_tokens, "s": res.seconds, "fr": res.finish_reason}),
                        datetime.now(timezone.utc).isoformat()))
+    check_job()
     return res, False
 
 

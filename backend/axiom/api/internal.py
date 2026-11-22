@@ -178,12 +178,8 @@ def _save_worker(name: str, info: dict, models: dict, online: bool) -> None:
 
 def _release_jobs(name: str) -> int:
     """A worker went away: its running jobs go back to the queue (they resume from their checkpoints)."""
-    with db.connect() as c:
-        n = c.execute("UPDATE jobs SET status='pending', attempts=MAX(0, attempts-1), updated_at=? "
-                      "WHERE status='running' AND worker=?", (_now(), name)).rowcount
-        c.execute("UPDATE sections SET status='pending' WHERE status='running' AND id IN "
-                  "(SELECT target_id FROM jobs WHERE worker=? AND status='pending')", (name,))
-    return n
+    from axiom.orchestration import jobs
+    return jobs.recover(worker=name)
 
 
 # ---------------------------------------------------------------- HTTP cache for computed GETs (images)

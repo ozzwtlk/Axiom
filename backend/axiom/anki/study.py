@@ -14,7 +14,11 @@ from axiom.storage import db
 
 PROMPT_VERSION = "study-cards-v6"
 REVIEW_VERSION = "study-review-v4"
-PER_SECTION, PER_CHAPTER, PER_BOOK = 3, 10, 100
+PER_BATCH = 3
+
+
+def page_budget(pages: int) -> int:
+    return max(0, (pages + 1) // 2)
 
 
 class Card(BaseModel):
@@ -26,13 +30,13 @@ class Card(BaseModel):
 
 
 class Draft(BaseModel):
-    cards: list[dict] = Field(max_length=PER_SECTION)
+    cards: list[dict] = Field(max_length=PER_BATCH)
 
 
 class Review(BaseModel):
     model_config = ConfigDict(extra="forbid")
     checks: str
-    keep: list[int] = Field(max_length=PER_SECTION)
+    keep: list[int] = Field(max_length=PER_BATCH)
 
 
 def generate(section_id: str, model: str | None) -> dict:
@@ -51,8 +55,6 @@ def generate(section_id: str, model: str | None) -> dict:
         text = f"$${u['latex']}$$" if u.get("latex") else u.get("text_md", "")
         if text:
             units[uid] = (text[:1100], u.get("block_ids", []))
-        if len(units) >= 55:
-            break
     figures = {}
     blocks = db.q("SELECT id,page,block_type,raw_text,transcribed_md,x0 FROM blocks WHERE section_id=? ORDER BY ord",
                   (section_id,))
@@ -60,9 +62,7 @@ def generate(section_id: str, model: str | None) -> dict:
         if (b["block_type"] == "figure" and b["x0"] is not None and caption["block_type"] == "caption"
                 and b["page"] == caption["page"]):
             figures[b["id"]] = (caption["transcribed_md"] or caption["raw_text"])[:650]
-    if not units:
-        cards = []
-    else:
+    def draft_batch(units):
         unit_ids = {f"u{i}": uid for i, uid in enumerate(units, 1)}
         figure_ids = {f"f{i}": fid for i, fid in enumerate(figures, 1)}
         data = json.dumps({"section": sec["title"], "units": {k: units[v][0] for k, v in unit_ids.items()},
@@ -74,7 +74,7 @@ def generate(section_id: str, model: str | None) -> dict:
                 "sources": {"type": "array", "items": {"type": "string", "enum": list(unit_ids)}, "minItems": 1, "maxItems": 4},
                 "figure": {"type": "string", "enum": ["", *figure_ids]}}
         schema = {"type": "object", "additionalProperties": False, "required": ["cards"], "properties": {
-            "cards": {"type": "array", "maxItems": PER_SECTION, "items": {
+            "cards": {"type": "array", "maxItems": PER_BATCH, "items": {
                 "type": "object", "additionalProperties": False, "properties": item, "required": list(item)}}}}
 
         def validate(obj):
@@ -135,7 +135,25 @@ def generate(section_id: str, model: str | None) -> dict:
                               source=f"{sec['book']} §{sec['number']} {sec['title']}",
                               tags=[f"axiom::ch{sec['ch']}", f"axiom::study::{card.kind}"],
                               kind=card.kind, figure=card.figure))
+        return cards
+
+    items = list(units.items())
+    target = max(PER_BATCH, page_budget(sec["page_end"] - sec["page_start"] + 1))
+    # Batch long sections so they are not limited to the first few pages or three cards.
+    batches = min((len(items) + 7) // 8, max((len(items) + 54) // 55, (target + PER_BATCH - 1) // PER_BATCH))
+    drafts = [draft_batch(dict(items[i * len(items) // batches:(i + 1) * len(items) // batches]))
+              for i in range(batches)]
+    cards = []
+    seen = set()
+    for i in range(PER_BATCH):
+        for batch in drafts:
+            if len(cards) == target:
+                break
+            if i < len(batch) and batch[i]["guid"] not in seen:
+                cards.append(batch[i])
+                seen.add(batch[i]["guid"])
     with db.connect(immediate=True) as c:
+        llm.check_job()
         now = c.execute("SELECT stage FROM sections WHERE id=?", (section_id,)).fetchone()
         if not now or now["stage"] != "verified" or snapshot != [(r["id"], r["data"]) for r in c.execute(query, (section_id,))]:
             return {"skipped": "The section changed while generating; queue it again after processing finishes"}
@@ -144,27 +162,39 @@ def generate(section_id: str, model: str | None) -> dict:
 
 
 def build_cards(doc_id: str, chapters: list[int] | None = None) -> list[dict]:
+    doc = db.q1("SELECT page_count FROM documents WHERE id=?", (doc_id,))
+    if not doc:
+        return []
     sections: dict[int, list[list[dict]]] = {}
-    for row in db.q("SELECT c.number ch, sc.data FROM study_cards sc JOIN sections s ON s.id=sc.section_id "
-                    "JOIN chapters c ON c.id=s.chapter_id WHERE s.doc_id=? AND s.stage='verified' ORDER BY c.number,s.ord", (doc_id,)):
+    caps = {}
+    for row in db.q("SELECT c.number ch, c.page_start, c.page_end, sc.data FROM study_cards sc "
+                    "JOIN sections s ON s.id=sc.section_id JOIN chapters c ON c.id=s.chapter_id "
+                    "WHERE s.doc_id=? AND s.stage='verified' ORDER BY c.number,s.ord", (doc_id,)):
         if not chapters or row["ch"] in chapters:
-            sections.setdefault(row["ch"], []).append(json.loads(row["data"]))
-    # Take one card per section before any section's second card, and spread the book cap over chapters.
-    candidates = {ch: iter([sec[i] for i in range(PER_SECTION) for sec in rows if i < len(sec)])
-                  for ch, rows in sections.items()}
+            ch = row["ch"]
+            caps[ch] = page_budget(row["page_end"] - row["page_start"] + 1)
+            sections.setdefault(ch, []).append(json.loads(row["data"]))
+    # Prefer breadth across sections, and prioritize the chapters furthest from their proportional share.
+    candidates = {ch: iter([sec[i] for i in range(max(map(len, rows))) for sec in rows if i < len(sec)])
+                  for ch, rows in sections.items() if caps[ch]}
     selected: dict[int, list[dict]] = {ch: [] for ch in sections}
     seen = set()
-    picked = 0
-    for _ in range(PER_CHAPTER):
-        for ch, pool in candidates.items():
-            for card in pool:
+    for _ in range(page_budget(doc["page_count"])):
+        while candidates:
+            ch = min(candidates, key=lambda n: (len(selected[n]) / caps[n], -caps[n], n))
+            for card in candidates[ch]:
                 question = re.sub(r"\W+", " ", card["front"].casefold()).strip()
-                if card["guid"] in seen or question in seen:
+                if not question or card["guid"] in seen or question in seen:
                     continue
                 seen.update((card["guid"], question))
                 selected[ch].append(card)
-                picked += 1
-                if picked >= PER_BOOK:
-                    return [c for group in selected.values() for c in group]
+                if len(selected[ch]) == caps[ch]:
+                    del candidates[ch]
                 break
+            else:
+                del candidates[ch]
+                continue
+            break
+        else:
+            break
     return [c for group in selected.values() for c in group]

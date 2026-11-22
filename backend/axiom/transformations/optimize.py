@@ -571,7 +571,8 @@ def _store(section_id: str, doc_id: str, units: list[dict], summaries: list[str]
     pages = {r["id"]: r["page"] for r in db.q("SELECT id, page FROM blocks WHERE section_id=?", (section_id,))}
     for i, u in enumerate(units):
         u["id"] = f"{section_id}-u{i:03d}"
-    with db.connect() as c:
+    with db.connect(immediate=True) as c:
+        llm.check_job()
         _carry_visualizations(c, section_id, units)
         c.execute("DELETE FROM study_cards WHERE section_id=?", (section_id,))
         c.execute("DELETE FROM units WHERE section_id=?", (section_id,))

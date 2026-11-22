@@ -72,7 +72,8 @@ def generate(doc_id: str, model: str, variant: str) -> dict:
                                  Design.model_validate, doc_id=doc_id)
     png = render(doc["title"], design)
     revision = uuid4().hex
-    with db.connect() as c:
+    with db.connect(immediate=True) as c:
+        llm.check_job()
         c.execute("INSERT OR REPLACE INTO covers VALUES (?,?,?)",
                   (doc_id, revision, base64.b64encode(png).decode("ascii")))
     return {"revision": revision, "model": meta["model"]}

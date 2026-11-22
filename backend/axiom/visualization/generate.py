@@ -161,7 +161,8 @@ def visualize(unit_id: str, profile: str = "balanced", regenerate: bool = False,
     # anchored to the source blocks so it follows its passage when the section is re-optimized
     out = dict(v, unit_id=unit_id, model=meta["model"], ai_generated=True, anchor_blocks=sorted(d.get("block_ids", [])),
                automatic=bool(idea))
-    with db.connect() as c:
+    with db.connect(immediate=True) as c:
+        llm.check_job()
         c.execute("INSERT OR REPLACE INTO visualizations(unit_id, doc_id, data, created_at) VALUES (?,?,?,?)",
                   (unit_id, u["doc_id"], db.jdump(out), datetime.now(timezone.utc).isoformat()))
     return out

@@ -17,6 +17,7 @@ export interface DocumentSummary {
   chapters_done: number;
   completed: boolean;
   cover_revision: string | null;
+  reading_section_ids: string[];
 }
 
 export interface SectionSummary {
@@ -116,6 +117,7 @@ export interface ExerciseSummary {
 }
 
 export interface SectionView {
+  is_exercises?: boolean;
   id: string;
   document_id: string;
   chapter_number: number;
@@ -327,7 +329,7 @@ export interface ModelInfo {
 }
 export type TaskGroup =
   | "transcribe" | "optimize" | "digest" | "faithfulness"
-  | "ask" | "hint" | "solve" | "check" | "quiz" | "visualize";
+  | "ask" | "hint" | "solve" | "check" | "quiz" | "visualize" | "anki" | "cover";
 export interface GroupInfo {
   id: TaskGroup;
   label: string;

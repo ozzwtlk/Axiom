@@ -77,8 +77,8 @@ export function coverUrl(docId: string, revision: string) {
   return `${BASE}/documents/${enc(docId)}/cover.png?v=${enc(revision)}`;
 }
 
-export function queueAnki(docId: string, regenerate = false) {
-  return request<ProcessResponse>(`/documents/${enc(docId)}/anki/generate?regenerate=${regenerate}`, { method: "POST" });
+export function queueAnki(docId: string, regenerate = false, model = "auto") {
+  return request<ProcessResponse>(`/documents/${enc(docId)}/anki/generate?regenerate=${regenerate}`, json({ model }));
 }
 
 export function getStudyCards(docId: string) {
@@ -100,6 +100,8 @@ export interface QueuedJob {
   parallel: number;
   worker: string | null;
   error: string | null;
+  requested_action: "abort" | "restart" | null;
+  restart_model: string | null;
 }
 
 export function listJobs() {
@@ -107,7 +109,7 @@ export function listJobs() {
   return request<{ jobs: QueuedJob[] }>("/jobs");
 }
 
-export function changeJob(id: string, changes: { action: "model"; model: string | null } | { action: "move_first" }) {
+export function changeJob(id: string, changes: { action: "model" | "restart"; model: string | null } | { action: "move_first" | "abort" }) {
   return request<void>(`/jobs/${enc(id)}`, { ...json(changes), method: "PATCH" });
 }
 

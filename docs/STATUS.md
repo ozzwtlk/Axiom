@@ -109,7 +109,7 @@ frontend `pnpm test` → 15 passed; `pnpm e2e` → 14/14 against the live server
    choice shows the error. The CLIs cannot read images here, so transcription stays local (or a paid API).
 4. Paid-API adapters are implemented and unit-tested with fakes only (no key was configured).
 5. Hints and quiz grades are AI judgements; solutions carry “consistent / inconsistent” evidence, hints do not.
-6. Books without a PDF outline fall back to a single section; notation is shown, never normalized across books.
+6. Books without a usable PDF outline fall back to a single section if a numbered printed contents table cannot be matched to body headings. Image-only contents pages need an OCR text layer. Notation is shown, never normalized across books.
 
 ## Next priorities
 

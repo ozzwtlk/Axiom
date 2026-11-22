@@ -167,6 +167,7 @@ export const mockDocument: DocumentDetail = {
   chapters_done: 0,
   completed: false,
   cover_revision: null,
+  reading_section_ids: ["s-1-1", "s-1-2", "s-1-3", "s-1-4", "s-2-1"],
   chapters: [
     {
       id: "c-1", number: 1, title: "Special Relativity and Flat Spacetime", page_start: 17, page_end: 64, status: "partial", completed: false,
@@ -190,7 +191,7 @@ export const mockDocument: DocumentDetail = {
 export const mockDocuments: DocumentSummary[] = [
   {
     id: mockDocument.id, title: mockDocument.title, page_count: mockDocument.page_count,
-    created_at: mockDocument.created_at, chapters_total: 2, chapters_done: 0, completed: false, cover_revision: null,
+    created_at: mockDocument.created_at, chapters_total: 2, chapters_done: 0, completed: false, cover_revision: null, reading_section_ids: mockDocument.reading_section_ids,
   },
 ];
 
