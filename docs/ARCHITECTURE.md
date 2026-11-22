@@ -70,7 +70,7 @@ for `optimize(s_{i-1})` (its summary is context). A section is readable after `o
 | Mastery checks / chapter exams | questions only from units that passed the faithfulness check, each citing its source units; every multiple-choice question is answered blind (key hidden) and dropped if the blind answer differs; MCQ graded deterministically, short answers by rubric |
 | Exercise-first mode | deterministic exercise→section map (shared concepts, cited equation numbers); practice page + "try first" box in the reader |
 | Visualizations | saved in `visualizations`, anchored to source blocks (`anchor_blocks`) so re-optimizing moves them to the unit that now shows the passage (none fits → kept as `detached:<section>:…`, re-attached later); shown automatically in the reader; "save as file" download. Model writes plain HTML/JS; static screen (no network/storage/parent access/eval/external URLs); served by the server inside its own document with `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; connect-src 'none' …`; embedded in `<iframe sandbox="allow-scripts">` without `allow-same-origin` |
-| Anki | deterministic cards from verified units (flagged units skipped); `.apkg` (genanki, note type "AXIOM Basic", stable GUIDs), `.txt` import file, or AnkiConnect push to the local Anki (updates notes by `AxiomID`). Files are kept in `data/exports/` |
+| Anki | Section jobs draft and review standalone reasoning, ansatz, derivation and figure cards using verified/source units; defaults to the local model. Per-section/chapter/book caps are 3/10/100. `.apkg` and AnkiConnect include genuine PDF figure crops; `.txt` is text-only. Notes use stable source-based IDs. Rebuilding or importing does not delete existing notes in Anki. |
 
 ### Mathematical integrity rules (enforced in code, not prompts)
 1. Equation units always carry the **transcribed** LaTeX of the source equation; the optimizer can only attach annotations. Any rewrite of an equation is stored separately and marked `ai_generated`.
@@ -105,7 +105,11 @@ All JSON. Base `/api`.
 |---|---|---|
 | GET | `/documents` | `DocumentSummary[]` |
 | POST | `/documents` (multipart `file`) | `DocumentSummary` |
-| GET | `/documents/{doc_id}` | `DocumentDetail` (chapters → sections with status) |
+| GET | `/documents/{doc_id}` | `DocumentDetail` (chapters → sections with status and generated cover revision) |
+| DELETE | `/documents/{doc_id}` | `204`; deletes AXIOM's library copy and derived state. Refused while any job for the book is queued or running. |
+| POST / GET | `/documents/{doc_id}/cover` / `/documents/{doc_id}/cover.png` | Queue a Codex cover design / read the locally rendered PNG; Codex receives only the title and a variation seed. |
+| GET | `/jobs` | Running work, queue priority order, dependencies, model overrides and history |
+| PATCH / DELETE | `/jobs/{job_id}` | For waiting jobs: change model, move to front, or cancel job and hard dependents. Priority does not override dependencies or worker capabilities. |
 | POST | `/documents/{doc_id}/process` body `{chapters: number[], profile: "economy"\|"balanced"\|"max"}` | `{job_ids: string[]}` |
 | GET | `/documents/{doc_id}/progress` | `ProgressReport` |
 | GET | `/sections/{section_id}` | `SectionView` |
@@ -117,6 +121,7 @@ All JSON. Base `/api`.
 | POST | `/exercises/{exercise_id}/hint` body `{level: 1..5}` | `{level, hint_md, model, cached}` |
 | GET | `/search?doc_id=&q=` | `SearchHit[]` |
 
+| POST | `/documents/{doc_id}/anki/generate[?regenerate=true]` | Queue study-card generation for verified sections; by default skip sections already generated. |
 | GET | `/documents/{doc_id}/anki?format=apkg\|tsv\|json&deck=&chapters=` | `.apkg` / `.txt` download (also written to `data/exports/`) or card preview |
 | POST | `/documents/{doc_id}/anki/push` body `{deck, chapters?}` | `{added, updated, deck}` via AnkiConnect (127.0.0.1:8765) |
 | GET / POST | `/exercises/{id}/solution` | stored solution (GET, 404 if none) / generate it (POST, minutes) |

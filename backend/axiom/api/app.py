@@ -10,6 +10,7 @@ import re
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -51,6 +52,11 @@ class CheckRequest(BaseModel):
 
 
 class ModelChoice(BaseModel):
+    model: str | None = None
+
+
+class JobUpdate(BaseModel):
+    action: Literal["model", "move_first"]
     model: str | None = None
 
 
@@ -98,11 +104,17 @@ def _chapter_status(statuses: list[str]) -> str:
 def _doc_summary(d) -> DocumentSummary:
     chs = db.q("SELECT id FROM chapters WHERE doc_id=?", (d["id"],))
     done = 0
+    verified = 0
     for ch in chs:
-        st = [r["status"] for r in db.q("SELECT status FROM sections WHERE chapter_id=?", (ch["id"],))]
-        done += int(_chapter_status(st) in ("done",) or (st and all(s in ("done", "partial") for s in st)))
+        secs = db.q("SELECT status,stage FROM sections WHERE chapter_id=?", (ch["id"],))
+        st = [r["status"] for r in secs]
+        status = _chapter_status(st)
+        verified += int(status == "done" and all(s["stage"] == "verified" for s in secs))
+        done += int(status == "done" or bool(st and all(s in ("done", "partial") for s in st)))
+    cover = db.q1("SELECT revision FROM covers WHERE doc_id=?", (d["id"],))
     return DocumentSummary(id=d["id"], title=d["title"], page_count=d["page_count"], created_at=d["created_at"],
-                           chapters_total=len(chs), chapters_done=done)
+                           chapters_total=len(chs), chapters_done=done, completed=bool(chs) and verified == len(chs),
+                           cover_revision=cover["revision"] if cover else None)
 
 
 def _unit(u: dict) -> Unit:
@@ -226,7 +238,7 @@ def create_app(start_worker: bool = True) -> FastAPI:
             await asyncio.to_thread(_store_in_inbox, file.file, safe)
             return JSONResponse({"queued": True, "filename": safe}, status_code=202)
         doc_id = await asyncio.to_thread(_import_upload, file.file, Path(file.filename).name)
-        return _doc_summary(db.q1("SELECT * FROM documents WHERE id=?", (doc_id,)))
+        return await asyncio.to_thread(lambda: _doc_summary(db.q1("SELECT * FROM documents WHERE id=?", (doc_id,))))
 
     def _store_in_inbox(src, safe: str) -> str:
         import shutil
@@ -264,10 +276,39 @@ def create_app(start_worker: bool = True) -> FastAPI:
             chapters.append(ChapterSummary(
                 id=ch["id"], number=ch["number"], title=ch["title"], page_start=ch["page_start"], page_end=ch["page_end"],
                 status=_chapter_status([s["status"] for s in secs]),
+                completed=bool(secs) and all(s["status"] == "done" and s["stage"] == "verified" for s in secs),
                 sections=[SectionSummary(id=s["id"], number=s["number"], title=s["title"], page_start=s["page_start"],
-                                         page_end=s["page_end"], status=s["status"], is_exercises=bool(s["is_exercises"]))
+                                         page_end=s["page_end"], status=s["status"], completed=s["status"] == "done" and s["stage"] == "verified",
+                                         is_exercises=bool(s["is_exercises"]))
                           for s in secs]))
         return DocumentDetail(**_doc_summary(d).model_dump(), chapters=chapters)
+
+    @app.delete("/api/documents/{doc_id}", status_code=204)
+    def delete_document(doc_id: str):
+        from axiom.storage.library import remove_document
+        try:
+            remove_document(doc_id)
+        except KeyError:
+            raise HTTPException(404, "document not found")
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        return Response(status_code=204)
+
+    @app.post("/api/documents/{doc_id}/cover")
+    def make_cover(doc_id: str):
+        from axiom.orchestration.jobs import enqueue_cover
+        try:
+            return {"job_id": enqueue_cover(doc_id)}
+        except KeyError:
+            raise HTTPException(404, "document not found")
+
+    @app.get("/api/documents/{doc_id}/cover.png")
+    def get_cover(doc_id: str):
+        import base64
+        row = db.q1("SELECT png FROM covers WHERE doc_id=?", (doc_id,))
+        if not row:
+            raise HTTPException(404, "cover not found")
+        return Response(base64.b64decode(row["png"]), media_type="image/png")
 
     @app.post("/api/documents/{doc_id}/restructure")
     def restructure_document(doc_id: str, force: bool = False):
@@ -294,7 +335,10 @@ def create_app(start_worker: bool = True) -> FastAPI:
         if body.parallel and (not model or models.kind(model) == "local"):
             raise HTTPException(400, "parallel processing needs a premium model (Claude Code, Codex or an API); "
                                      "the local model has a single GPU")
-        return {"job_ids": jobs.enqueue_document(doc_id, body.chapters, body.profile, model, body.parallel)}
+        try:
+            return {"job_ids": jobs.enqueue_document(doc_id, body.chapters, body.profile, model, body.parallel)}
+        except KeyError:
+            raise HTTPException(404, "document not found")
 
     @app.get("/api/documents/{doc_id}/quality")
     def get_quality(doc_id: str):
@@ -310,7 +354,33 @@ def create_app(start_worker: bool = True) -> FastAPI:
         if not db.q1("SELECT 1 FROM documents WHERE id=?", (doc_id,)):
             raise HTTPException(404, "document not found")
         model = None if body.model in (None, "", "auto") else body.model
-        return {"job_ids": jobs.enqueue_quality(doc_id, body.rerun, body.profile, model)}
+        try:
+            return {"job_ids": jobs.enqueue_quality(doc_id, body.rerun, body.profile, model)}
+        except KeyError:
+            raise HTTPException(404, "document not found")
+
+    @app.get("/api/jobs")
+    def list_jobs():
+        from axiom.orchestration.jobs import queue_snapshot
+        return {"jobs": queue_snapshot()}
+
+    @app.patch("/api/jobs/{job_id}", status_code=204)
+    def update_job(job_id: str, body: JobUpdate):
+        from axiom.orchestration.jobs import update_pending
+        try:
+            update_pending(job_id, model=body.model, move_first=body.action == "move_first")
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        return Response(status_code=204)
+
+    @app.delete("/api/jobs/{job_id}", status_code=204)
+    def remove_job(job_id: str):
+        from axiom.orchestration.jobs import update_pending
+        try:
+            update_pending(job_id, remove=True)
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        return Response(status_code=204)
 
     @app.post("/api/jobs/reset")
     def reset_jobs(doc_id: str | None = None, include_done: bool = False):
@@ -471,14 +541,31 @@ def create_app(start_worker: bool = True) -> FastAPI:
                 break
         return hits
 
+    @app.post("/api/documents/{doc_id}/anki/generate")
+    def anki_generate(doc_id: str, regenerate: bool = False):
+        from axiom.orchestration.jobs import enqueue_anki
+        try:
+            return {"job_ids": enqueue_anki(doc_id, regenerate)}
+        except KeyError:
+            raise HTTPException(404, "document not found")
+
     @app.get("/api/documents/{doc_id}/anki")
-    def anki_export(doc_id: str, deck: str = "AXIOM", chapters: str | None = None, format: str = "tsv"):
-        require_compute()
+    def anki_export(doc_id: str, deck: str = "AXIOM", chapters: str | None = None,
+                    format: Literal["tsv", "apkg", "json"] = "tsv"):
+        if format == "apkg":
+            require_compute()
         from axiom.anki.export import build_cards, export_path, to_apkg, to_tsv
-        chs = [int(x) for x in chapters.split(",")] if chapters else None
+        if not db.q1("SELECT 1 FROM documents WHERE id=?", (doc_id,)):
+            raise HTTPException(404, "document not found")
+        try:
+            chs = [int(x) for x in chapters.split(",")] if chapters else None
+        except ValueError:
+            raise HTTPException(400, "chapters must be comma-separated numbers")
         cards = build_cards(doc_id, chs)
-        if format == "json":  # preview
+        if format == "json":
             return cards
+        if not cards:
+            raise HTTPException(409, "Generate study cards before exporting")
         path = export_path(doc_id, deck, format)  # also kept on disk under data/exports/
         if format == "apkg":
             to_apkg(cards, deck, path)
@@ -491,7 +578,10 @@ def create_app(start_worker: bool = True) -> FastAPI:
         require_compute()
         from axiom.anki.export import build_cards, push_ankiconnect
         try:
-            return push_ankiconnect(build_cards(doc_id, body.chapters), body.deck)
+            cards = build_cards(doc_id, body.chapters)
+            if not cards:
+                raise HTTPException(409, "Generate study cards before exporting")
+            return push_ankiconnect(cards, body.deck)
         except ConnectionError as e:
             raise HTTPException(503, str(e))
         except RuntimeError as e:

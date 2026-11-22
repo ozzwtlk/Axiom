@@ -410,3 +410,110 @@ def test_auto_diagrams_run_on_the_chosen_model_and_never_fail_the_run(tmp_db, fa
     db.q("DELETE FROM jobs")
     db.conn().commit()
     assert jobs.enqueue_diagrams("d-s1.1") == []
+
+
+def test_jobs_api_priority_models_and_dependencies(tmp_db, monkeypatch):
+    from fastapi.testclient import TestClient
+    from axiom.api.app import create_app
+    from axiom.orchestration import jobs, models
+    _section([])
+    monkeypatch.setattr(models, "available", lambda _: True)
+    extract, tr, opt, verify, _ = jobs.enqueue_document("d", [1], parallel=True, model="claude-code:sonnet")
+    with TestClient(create_app(start_worker=False)) as client:
+        assert client.patch(f"/api/jobs/{opt}", json={"action": "move_first"}).status_code == 204
+        first = client.get("/api/jobs").json()["jobs"][0]
+        assert first["id"] == opt and first["depends_on"] == [tr] and first["parallel"]
+        edit = {"action": "model", "model": "codex:default"}
+        assert client.patch(f"/api/jobs/{tr}", json=edit).status_code == 409
+        assert client.patch(f"/api/jobs/{opt}", json=edit).status_code == 204
+        assert jobs._claim(("extract", "optimize"))["id"] == extract
+        assert client.delete(f"/api/jobs/{extract}").status_code == 409
+        assert client.delete(f"/api/jobs/{tr}").status_code == 204
+        states = {j["id"]: j for j in client.get("/api/jobs").json()["jobs"]}
+        assert {states[x]["status"] for x in (tr, opt, verify)} == {"cancelled"}
+        assert states[opt]["model"] == "codex:default"
+
+
+def test_remove_document_and_generated_cover(tmp_db, fake):
+    from fastapi.testclient import TestClient
+    from axiom.api.app import create_app
+    from axiom.config import settings
+    from axiom.orchestration import jobs
+    _section([("paragraph", "text")], [_unit("text", ["b0"])])
+    original = settings.doc_dir("d") / "original.pdf"
+    original.parent.mkdir(parents=True)
+    original.write_bytes(b"owned copy")
+    external = settings.data_dir / "upload-source.pdf"
+    external.write_bytes(b"original upload")
+    fake({"Design a sophisticated": lambda _: dict(palette=["#0d1130", "#ecca88", "#92cce9"],
+          marks=[dict(x=.5, y=.5, radius=r, color=1, filled=False) for r in (.1, .2, .3)])}, cls="codex:default")
+    with TestClient(create_app(start_worker=False)) as client:
+        assert not client.get("/api/documents/d").json()["completed"]  # readable but not verified
+        with db.connect() as c:
+            c.execute("UPDATE sections SET stage='verified'")
+        assert client.get("/api/documents/d").json()["completed"]
+        jid = client.post("/api/documents/d/cover").json()["job_id"]
+        assert client.delete("/api/documents/d").status_code == 409
+        jobs._run(dict(db.q1("SELECT * FROM jobs WHERE id=?", (jid,))))
+        assert client.get("/api/documents/d").json()["cover_revision"]
+        assert client.get("/api/documents/d/cover.png").content.startswith(b"\x89PNG")
+        assert client.delete("/api/documents/d").status_code == 204
+        assert client.get("/api/documents/d/cover.png").status_code == 404
+    assert not original.exists() and external.exists()
+    for table in ("blocks", "units", "coverage", "jobs", "covers"):
+        assert not db.q(f"SELECT 1 FROM {table}")
+
+
+def test_study_deck_keeps_reviewed_figure_and_packages_media(tmp_db, fake, tmp_path):
+    import zipfile
+    import pymupdf
+    from axiom.anki import export
+    from axiom.config import settings
+    from axiom.orchestration import jobs
+    unit = _unit("The light cone divides the tangent plane into causal regions.", ["b0"])
+    unit["verification"] = {"status": "verified"}
+    _section([("paragraph", "light cone"), ("figure", ""), ("caption", "Inside the cone, events are timelike.")], [unit])
+    with db.connect() as c:
+        c.execute("UPDATE sections SET stage='verified'")
+    img = settings.doc_dir("d") / "original.pdf"
+    img.parent.mkdir(parents=True)
+    with pymupdf.open() as pdf:
+        pdf.new_page().draw_line((0, 11), (100, 17))
+        pdf.save(img)
+    source = ["u1"]
+    fake({"Generate zero to three": lambda _: {"cards": [
+        dict(kind="figure", question="What makes the events inside the depicted light cone timelike?",
+             answer="They can be reached from the origin below light speed.", sources=source, figure="f1"),
+        dict(kind="concept", question="What is the arbitrary component of the tensor?",
+             answer="It is an arbitrary component.", sources=source),
+    ]}, "Audit these candidate": lambda _: {"checks": "First grounded; second rote.", "keep": [0]}})
+    jid, = jobs.enqueue_anki("d")
+    jobs._run(dict(db.q1("SELECT * FROM jobs WHERE id=?", (jid,))))
+    assert not jobs.enqueue_anki("d")
+    cards = export.build_cards("d")
+    assert len(cards) == 1 and cards[0]["figure"] == "b1"
+    assert "timelike" not in export.to_tsv(cards, "Study")
+    dst = tmp_path / "study.apkg"
+    assert export.to_apkg(cards, "Study", dst) == 1
+    with zipfile.ZipFile(dst) as pkg:
+        media = json.loads(pkg.read("media"))
+        assert list(media.values())[0].endswith(".png")
+        assert pkg.read(next(iter(media))).startswith(b"\x89PNG")
+    assert jobs.enqueue_anki("d", regenerate=True) != [jid]
+
+
+def test_study_deck_spreads_caps_across_sections_and_chapters(tmp_db, monkeypatch):
+    from axiom.anki import study
+    _section([])
+    monkeypatch.setattr(study, "PER_BOOK", 3)
+    monkeypatch.setattr(study, "PER_CHAPTER", 2)
+    with db.connect() as c:
+        c.execute("INSERT INTO chapters(id,doc_id,number,title,page_start,page_end) VALUES ('d-c2','d',2,'C',2,3)")
+        for i, ch in ((1, 1), (2, 1), (3, 2)):
+            sid = f"s{i}"
+            c.execute("INSERT INTO sections(id,doc_id,chapter_id,ord,number,title,page_start,page_end,stage) "
+                      "VALUES (?,'d',?,?,?,'S',1,2,'verified')", (sid, f"d-c{ch}", i, sid))
+            cards = [dict(guid=f"{sid}-{n}", front=f"Question {sid} {n}") for n in range(3)]
+            c.execute("INSERT INTO study_cards VALUES (?,?)", (sid, json.dumps(cards)))
+    assert [c["guid"] for c in study.build_cards("d")] == ["s1-0", "s2-0", "s3-0"]
+    assert [c["guid"] for c in study.build_cards("d", [2])] == ["s3-0", "s3-1"]

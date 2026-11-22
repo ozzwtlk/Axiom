@@ -21,6 +21,8 @@ class DocumentSummary(BaseModel):
     created_at: str
     chapters_total: int
     chapters_done: int
+    completed: bool = False
+    cover_revision: str | None = None
 
 
 class SectionSummary(BaseModel):
@@ -30,6 +32,7 @@ class SectionSummary(BaseModel):
     page_start: int  # 1-based PDF page index
     page_end: int
     status: Status
+    completed: bool = False
     is_exercises: bool = False
 
 
@@ -40,6 +43,7 @@ class ChapterSummary(BaseModel):
     page_start: int
     page_end: int
     status: Status
+    completed: bool = False
     sections: list[SectionSummary]
 
 

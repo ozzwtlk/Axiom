@@ -39,7 +39,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiError(res.status, `${res.status} ${detail}`);
   }
-  return (await res.json()) as T;
+  return res.status === 204 ? (undefined as T) : (await res.json()) as T;
 }
 
 function json(body: unknown): RequestInit {
@@ -63,6 +63,56 @@ export function uploadDocument(file: File): Promise<DocumentSummary | { queued: 
   const fd = new FormData();
   fd.append("file", file);
   return request("/documents", { method: "POST", body: fd });
+}
+
+export function removeDocument(docId: string) {
+  return request<void>(`/documents/${enc(docId)}`, { method: "DELETE" });
+}
+
+export function queueCover(docId: string) {
+  return request<{ job_id: string }>(`/documents/${enc(docId)}/cover`, { method: "POST" });
+}
+
+export function coverUrl(docId: string, revision: string) {
+  return `${BASE}/documents/${enc(docId)}/cover.png?v=${enc(revision)}`;
+}
+
+export function queueAnki(docId: string, regenerate = false) {
+  return request<ProcessResponse>(`/documents/${enc(docId)}/anki/generate?regenerate=${regenerate}`, { method: "POST" });
+}
+
+export function getStudyCards(docId: string) {
+  if (MOCK) return Promise.resolve([]);
+  return request<{ guid: string; front: string; back: string; source: string; figure?: string | null }[]>(`/documents/${enc(docId)}/anki?format=json`);
+}
+
+export interface QueuedJob {
+  id: string;
+  doc_id: string;
+  title: string | null;
+  kind: string;
+  target_id: string;
+  status: "pending" | "running" | "done" | "failed" | "cancelled";
+  depends_on: string[];
+  model: string | null;
+  model_group: string | null;
+  priority: number;
+  parallel: number;
+  worker: string | null;
+  error: string | null;
+}
+
+export function listJobs() {
+  if (MOCK) return Promise.resolve({ jobs: [] as QueuedJob[] });
+  return request<{ jobs: QueuedJob[] }>("/jobs");
+}
+
+export function changeJob(id: string, changes: { action: "model"; model: string | null } | { action: "move_first" }) {
+  return request<void>(`/jobs/${enc(id)}`, { ...json(changes), method: "PATCH" });
+}
+
+export function removeJob(id: string) {
+  return request<void>(`/jobs/${enc(id)}`, { method: "DELETE" });
 }
 
 export function getDocument(docId: string): Promise<DocumentDetail> {

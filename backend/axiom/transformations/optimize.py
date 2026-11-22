@@ -573,6 +573,7 @@ def _store(section_id: str, doc_id: str, units: list[dict], summaries: list[str]
         u["id"] = f"{section_id}-u{i:03d}"
     with db.connect() as c:
         _carry_visualizations(c, section_id, units)
+        c.execute("DELETE FROM study_cards WHERE section_id=?", (section_id,))
         c.execute("DELETE FROM units WHERE section_id=?", (section_id,))
         c.execute("DELETE FROM coverage WHERE section_id=?", (section_id,))
         c.execute("DELETE FROM notation WHERE section_id=?", (section_id,))

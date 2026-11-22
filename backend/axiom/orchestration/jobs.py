@@ -57,6 +57,7 @@ def enqueue_document(doc_id: str, chapter_numbers: list[int], profile: str = "ec
     # sections of the book, so it must not depend on how far a parallel chapter has got (stable cache keys)
     prev_opt = None
     with db.connect() as c:
+        _lock_document(c, doc_id)
         for n in sorted(chapter_numbers):
             if parallel:
                 prev_opt = None
@@ -66,7 +67,10 @@ def enqueue_document(doc_id: str, chapter_numbers: list[int], profile: str = "ec
             ex = _extract_job(c, doc_id, ch, profile, model, parallel)
             ids.append(ex)
             for s in c.execute("SELECT * FROM sections WHERE chapter_id=? ORDER BY ord", (ch["id"],)).fetchall():
-                if s["status"] in ("partial", "failed"):
+                if s["status"] in ("partial", "failed") and not c.execute(
+                    "SELECT 1 FROM jobs WHERE target_id=? AND kind IN ('transcribe','optimize','verify') "
+                    "AND status IN ('pending','running')", (s["id"],)
+                ).fetchone():
                     _forget_section_jobs(c, s["id"])  # finished jobs would make this a no-op: run it again
                 tr = _add(c, doc_id, "transcribe", s["id"], [ex], profile, model, parallel)
                 op = _add(c, doc_id, "optimize", s["id"], [tr] + (["~" + prev_opt] if prev_opt else []), profile, model, parallel)
@@ -114,6 +118,7 @@ def enqueue_quality(doc_id: str, rerun: bool, profile: str = "economy", model: s
     (verbatim passages, broken transcriptions, unchecked batches) are queued again — only those parts cost calls."""
     ids = []
     with db.connect() as c:
+        _lock_document(c, doc_id)
         for s in c.execute("SELECT id FROM sections WHERE doc_id=? AND status IN ('done','partial','failed') ORDER BY ord",
                            (doc_id,)).fetchall():
             c.execute("DELETE FROM jobs WHERE kind='quality' AND target_id LIKE ? AND status!='running'", (s["id"] + "|%",))
@@ -140,9 +145,16 @@ def _extract_job(c, doc_id: str, ch, profile: str, model: str | None, parallel: 
     secs = [s["id"] for s in c.execute("SELECT id FROM sections WHERE chapter_id=?", (ch["id"],))]
     marks = ",".join("?" * len(secs)) or "NULL"
     have = {r["section_id"] for r in c.execute(f"SELECT DISTINCT section_id FROM blocks WHERE section_id IN ({marks})", secs)}
-    if not have or len(have) == len(secs):
+    existing = c.execute("SELECT id FROM jobs WHERE target_id=? AND kind IN ('extract','reextract') "
+                         "AND status IN ('pending','running')", (ch["id"],)).fetchone()
+    if existing:
+        return existing["id"]
+    if not have or len(have) == len(secs) or c.execute(
+        f"SELECT 1 FROM jobs WHERE status='running' AND target_id IN ({marks}) "
+        "AND kind IN ('transcribe','optimize','verify')", secs
+    ).fetchone():
         return _add(c, doc_id, "extract", ch["id"], [], profile, model, parallel)
-    c.execute(f"DELETE FROM jobs WHERE status IN ('pending','running','failed','cancelled') AND target_id IN ({marks})"
+    c.execute(f"DELETE FROM jobs WHERE status IN ('pending','failed','cancelled') AND target_id IN ({marks})"
               " AND kind IN ('transcribe','optimize','verify')", secs)
     c.execute("DELETE FROM jobs WHERE kind='reextract' AND target_id=?", (ch["id"],))
     log.info("chapter %s has sections without blocks: re-extracting", ch["number"])
@@ -198,7 +210,88 @@ def recover() -> int:
 
 
 _GROUP_OF_KIND = {"transcribe": "transcribe", "optimize": "optimize", "verify": "faithfulness",
-                  "reconcile": "optimize", "diagram": "visualize"}
+                  "reconcile": "optimize", "diagram": "visualize", "anki": "anki", "cover": "cover"}
+
+
+def _lock_document(c, doc_id):
+    if not c.execute("UPDATE documents SET id=id WHERE id=?", (doc_id,)).rowcount:
+        raise KeyError(doc_id)
+
+
+def enqueue_cover(doc_id: str) -> str:
+    with db.connect() as c:
+        _lock_document(c, doc_id)
+        c.execute("DELETE FROM jobs WHERE doc_id=? AND kind='cover' AND status='done'", (doc_id,))
+        return _add(c, doc_id, "cover", doc_id, [], "economy", "codex:default")
+
+
+def enqueue_anki(doc_id: str, regenerate: bool = False) -> list[str]:
+    ids = []
+    with db.connect() as c:
+        _lock_document(c, doc_id)
+        rows = c.execute("SELECT s.id, sc.section_id AS generated FROM sections s LEFT JOIN study_cards sc "
+                         "ON sc.section_id=s.id WHERE s.doc_id=? AND s.stage='verified' AND s.is_exercises=0 "
+                         "ORDER BY s.ord", (doc_id,)).fetchall()
+        for row in rows:
+            sid = row["id"]
+            if row["generated"] and not regenerate:
+                continue
+            c.execute("DELETE FROM jobs WHERE target_id=? AND kind='anki' AND status='done'", (sid,))
+            ids.append(_add(c, doc_id, "anki", sid, [], "economy"))
+    return ids
+
+
+def queue_snapshot() -> list[dict]:
+    return [dict(r, depends_on=json.loads(r["depends_on"]), model_group=_GROUP_OF_KIND.get(r["kind"]))
+            for r in db.q("SELECT j.id,j.doc_id,j.kind,j.target_id,j.status,j.depends_on,j.model,j.worker,"
+                          "j.priority,j.parallel,j.error,d.title FROM jobs j LEFT JOIN documents d ON d.id=j.doc_id "
+                          "ORDER BY CASE j.status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, "
+                          "CASE WHEN j.status='pending' THEN j.priority END, "
+                          "CASE WHEN j.status NOT IN ('running','pending') THEN j.updated_at END DESC,j.created_at,j.rowid")]
+
+
+def update_pending(job_id: str, *, model: str | None = None, move_first: bool = False, remove: bool = False) -> None:
+    from axiom.orchestration import models
+    with db.connect() as c:
+        if not c.execute("UPDATE jobs SET id=id WHERE id=? AND status='pending'", (job_id,)).rowcount:
+            raise ValueError("Only waiting jobs can be changed; refresh the queue.")
+        job = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if remove:
+            # Keep tombstones so ordering-only dependencies can proceed; cancel hard descendants atomically.
+            cancelled = {job_id}
+            pending = c.execute("SELECT id,depends_on,target_id,kind FROM jobs WHERE doc_id=? AND status='pending'",
+                                (job["doc_id"],)).fetchall()
+            while True:
+                more = {r["id"] for r in pending if cancelled.intersection(json.loads(r["depends_on"]))}
+                if more <= cancelled:
+                    break
+                cancelled.update(more)
+            for r in pending:
+                if r["id"] not in cancelled:
+                    continue
+                c.execute("UPDATE jobs SET status='cancelled',error='Removed from queue',updated_at=? WHERE id=?",
+                          (_now(), r["id"]))
+                if r["kind"] in ('transcribe', 'optimize', 'verify'):
+                    c.execute("UPDATE sections SET status='pending' WHERE id=? AND status='running' AND NOT EXISTS "
+                              "(SELECT 1 FROM jobs WHERE target_id=? AND status='running' "
+                              "AND kind IN ('transcribe','optimize','verify'))", (r["target_id"], r["target_id"]))
+                if r["kind"] == "verify":  # keep it readable, but invite re-processing to finish verification
+                    c.execute("UPDATE sections SET status='partial' WHERE id=? AND stage='optimized' AND status='done'",
+                              (r["target_id"],))
+        elif move_first:
+            c.execute("UPDATE jobs SET priority=(SELECT MIN(priority)-1 FROM jobs WHERE status='pending'),"
+                      "updated_at=? WHERE id=?", (_now(), job_id))
+        else:
+            group = _GROUP_OF_KIND.get(job["kind"])
+            if not group:
+                raise ValueError("This job does not use a model")
+            model = None if model in (None, "auto", "") else model
+            if job["kind"] == "cover" and (not model or not model.startswith("codex:")):
+                raise ValueError("Cover jobs require Codex")
+            if model and not any(m["id"] == model and (group != "transcribe" or m["vision"])
+                                 for m in models.catalog()):
+                raise ValueError("Unknown or incompatible model")
+            c.execute("UPDATE jobs SET model=?,updated_at=? WHERE id=?", (model, _now(), job_id))
 
 MAX_DIAGRAMS_PER_SECTION = 2
 
@@ -263,23 +356,24 @@ _claim_lock = threading.Lock()
 
 
 def _claim(kinds: tuple[str, ...], parallel_only: bool = False) -> dict | None:
-    with _claim_lock, db.connect() as c:
+    with _claim_lock, db.connect(immediate=True) as c:
         done = {r["id"] for r in c.execute("SELECT id FROM jobs WHERE status='done'")}
         failed = {r["id"] for r in c.execute("SELECT id FROM jobs WHERE status IN ('failed','cancelled')")}
+        active = {r["id"] for r in c.execute("SELECT id FROM jobs WHERE status IN ('pending','running')")}
         # "~<id>" = ordering-only dependency: wait until that job has finished, but do not inherit its failure
         # (the optimize chain: a failed earlier section must not fail every later section and chapter)
         sel_row = c.execute("SELECT value FROM meta WHERE key='compute.selected'").fetchone()
         selected = (sel_row["value"] if sel_row else None) or "auto"
         for j in c.execute(f"SELECT * FROM jobs WHERE status='pending' AND kind IN ({','.join('?' * len(kinds))})"
-                           " ORDER BY created_at, rowid", kinds).fetchall():
+                           " ORDER BY priority, created_at, rowid", kinds).fetchall():
             if parallel_only and not j["parallel"]:
                 continue
             all_deps = json.loads(j["depends_on"])
             deps = [d for d in all_deps if not d.startswith("~")]
             soft = [d[1:] for d in all_deps if d.startswith("~")]
-            if not all(d in done or d in failed for d in soft):
+            if any(d in active for d in soft):
                 continue
-            if any(d in failed for d in deps):
+            if any(d in failed or (d not in done and d not in active) for d in deps):
                 c.execute("UPDATE jobs SET status='failed', error='upstream dependency failed', updated_at=? WHERE id=?",
                           (_now(), j["id"]))
                 c.execute("UPDATE sections SET status='failed' WHERE id=? AND status NOT IN ('done','partial')",
@@ -336,6 +430,12 @@ def _run_kind(job: dict, kind: str, target: str, profile: str, should_stop) -> N
         result = _run_diagram(job)
     elif kind == "quality":
         result = _run_quality(job)
+    elif kind == "cover":
+        from axiom.ingestion.cover import generate
+        result = generate(job["doc_id"], job["model"], job["id"])
+    elif kind == "anki":
+        from axiom.anki.study import generate
+        result = generate(target, job["model"])
     else:
         raise ValueError(f"unknown job kind {kind}")
     with db.connect() as c:
@@ -365,7 +465,7 @@ def _worker(kinds: tuple[str, ...], idle_exit: bool, parallel_only: bool = False
                 st = "failed" if row["attempts"] >= row["max_attempts"] else "pending"
                 c.execute("UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
                           (st, f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}", _now(), job["id"]))
-                if st == "failed" and job["kind"] not in ("extract", "diagram", "quality"):
+                if st == "failed" and job["kind"] in ("transcribe", "optimize", "verify"):
                     c.execute("UPDATE sections SET status='failed' WHERE id=?", (job["target_id"],))
 
 
@@ -388,7 +488,7 @@ def start_workers(n_transcribe: int = 1, n_optimize: int | None = None, idle_exi
     # diagrams (a subscription model, not the GPU) run on their own thread, in parallel with the pipeline
     for kinds, n in ((("import", "extract", "reextract", "transcribe", "quality"), n_transcribe),
                      (("optimize", "verify", "extract", "reextract", "reconcile", "quality"), n_optimize),
-                     (("diagram",), 1)):
+                     (("diagram", "cover"), 1), (("anki",), 1)):
         for _ in range(n):
             t = threading.Thread(target=_worker, args=(kinds, idle_exit), daemon=True)
             t.start()

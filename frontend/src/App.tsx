@@ -6,6 +6,7 @@ import { MachinePicker } from "./components/MachinePicker";
 import { DocumentPage } from "./pages/DocumentPage";
 import { ExercisePage } from "./pages/ExercisePage";
 import { Library } from "./pages/Library";
+import { JobsPage } from "./pages/JobsPage";
 import { PracticePage } from "./pages/PracticePage";
 import { QuizPage } from "./pages/QuizPage";
 import { Reader } from "./pages/Reader";
@@ -39,6 +40,7 @@ function TopBar() {
         <Link to="/" className={loc.pathname === "/" ? "active" : ""}>
           Library
         </Link>
+        <Link to="/jobs" className={loc.pathname === "/jobs" ? "active" : ""}>Jobs</Link>
         <Link to="/settings" className={loc.pathname === "/settings" ? "active" : ""}>
           AI models
         </Link>
@@ -66,6 +68,7 @@ export function App() {
           <Route path="/exercise/:id" element={<ExercisePage />} />
           <Route path="/quiz/:scope/:id" element={<QuizPage />} />
           <Route path="/practice/:docId" element={<PracticePage />} />
+          <Route path="/jobs" element={<JobsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<main className="page"><p>Not found. <Link to="/">Library</Link></p></main>} />
         </Routes>

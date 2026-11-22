@@ -15,6 +15,8 @@ export interface DocumentSummary {
   created_at: string;
   chapters_total: number;
   chapters_done: number;
+  completed: boolean;
+  cover_revision: string | null;
 }
 
 export interface SectionSummary {
@@ -24,6 +26,7 @@ export interface SectionSummary {
   page_start: number; // 1-based PDF page index
   page_end: number;
   status: Status;
+  completed: boolean;
   is_exercises: boolean;
 }
 
@@ -34,6 +37,7 @@ export interface ChapterSummary {
   page_start: number;
   page_end: number;
   status: Status;
+  completed: boolean;
   sections: SectionSummary[];
 }
 

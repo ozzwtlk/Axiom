@@ -187,9 +187,27 @@ def _release_jobs(name: str) -> int:
 
 
 # ---------------------------------------------------------------- HTTP cache for computed GETs (images)
-def _cache_file(path: str, query: str) -> Path:
+def _cache_file(path: str, query: str) -> Path | None:
+    parts = path.split("/")
+    if len(parts) == 7 and parts[2] == "documents" and parts[4] == "pages":
+        row = db.q1("SELECT id AS doc_id FROM documents WHERE id=?", (parts[3],))
+    elif len(parts) == 5 and parts[2] == "blocks":
+        row = db.q1("SELECT doc_id FROM blocks WHERE id=?", (parts[3],))
+    else:
+        return None
+    if not row:
+        return None
     h = hashlib.sha256(f"{path}?{query}".encode()).hexdigest()
-    return settings.data_dir / "cache" / "http" / h[:2] / (h + ".bin")
+    return settings.doc_dir(row["doc_id"]) / "http-cache" / (h + ".bin")
+
+
+def _cache_image(path: Path, body: bytes) -> None:
+    # The book can be removed while a worker renders. Never recreate its directory.
+    try:
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(body)
+    except FileNotFoundError:
+        pass
 
 
 def _safe_rel(rel: str) -> Path:
@@ -336,10 +354,14 @@ def install(app: FastAPI) -> None:
             return await call_next(request)
         body = await request.body()  # cached by Starlette, so the local handler can still read it
         cacheable = request.method == "GET" and request.url.path.endswith(CACHEABLE)
-        if cacheable:
-            cf = _cache_file(request.url.path, request.url.query)
-            if cf.is_file():
-                return FileResponse(cf, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+        cf = await asyncio.to_thread(_cache_file, request.url.path, request.url.query) if cacheable else None
+        if cf:
+            try:
+                image = await asyncio.to_thread(cf.read_bytes)
+            except FileNotFoundError:
+                pass
+            else:
+                return Response(image, media_type="image/png", headers={"Cache-Control": "private, max-age=86400"})
         resp = await call_next(request)
         if resp.headers.get("x-axiom-needs-compute") != "1":
             return resp
@@ -352,9 +374,8 @@ def install(app: FastAPI) -> None:
             return JSONResponse({"detail": msg, "needs_compute": True}, status_code=503)
         hdrs = {k: v for k, v in request.headers.items() if k.lower() in ("content-type", "accept")}
         out = await registry.call(w, request.method, request.url.path, request.url.query, hdrs, body)
-        if cacheable and out.status_code == 200:
-            cf.parent.mkdir(parents=True, exist_ok=True)
-            cf.write_bytes(out.body)
+        if cf and out.status_code == 200:
+            await asyncio.to_thread(_cache_image, cf, out.body)
         return out
 
     @app.exception_handler(NeedsCompute)

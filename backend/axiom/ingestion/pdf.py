@@ -322,10 +322,14 @@ def restructure(doc_id: str, force: bool = False) -> dict:
     chapters = parse_outline(pdf.get_toc(False), pdf.page_count, pdf)
     if not chapters:
         return {"chapters": 0, "changed": False}
-    with db.connect() as c:
+    with db.connect(immediate=True) as c:
+        if not c.execute("SELECT 1 FROM documents WHERE id=?", (doc_id,)).fetchone():
+            raise KeyError(doc_id)
+        if c.execute("SELECT 1 FROM jobs WHERE doc_id=? AND status='running'", (doc_id,)).fetchone():
+            raise RuntimeError("Wait for running jobs to finish before restructuring this document")
         secs = [r["id"] for r in c.execute("SELECT id FROM sections WHERE doc_id=?", (doc_id,)).fetchall()]
         marks = ",".join("?" * len(secs)) or "NULL"
-        for t in ("units", "coverage", "notation", "concepts"):
+        for t in ("units", "coverage", "notation", "concepts", "study_cards"):
             c.execute(f"DELETE FROM {t} WHERE section_id IN ({marks})", secs)
         c.execute("DELETE FROM search_fts WHERE doc_id=?", (doc_id,))
         c.execute("DELETE FROM exercises WHERE doc_id=?", (doc_id,))

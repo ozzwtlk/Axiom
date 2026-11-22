@@ -110,6 +110,13 @@ CREATE TABLE IF NOT EXISTS visualizations (
   unit_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS covers (
+  doc_id TEXT PRIMARY KEY, revision TEXT NOT NULL, png TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS study_cards (
+  section_id TEXT PRIMARY KEY, data TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS workers (
   name TEXT PRIMARY KEY, info TEXT, models TEXT, last_seen TEXT, online INTEGER NOT NULL DEFAULT 0
 );
@@ -135,7 +142,7 @@ def init(path: Path) -> None:
 
 _COLUMNS = {  # columns added after schema v1 (CREATE TABLE IF NOT EXISTS does not add them to old databases)
     "sections": [("digest_md", "TEXT"), ("start_y", "REAL")],
-    "jobs": [("model", "TEXT"), ("worker", "TEXT"), ("parallel", "INTEGER NOT NULL DEFAULT 0")],
+    "jobs": [("model", "TEXT"), ("worker", "TEXT"), ("parallel", "INTEGER NOT NULL DEFAULT 0"), ("priority", "INTEGER NOT NULL DEFAULT 0")],
 }
 
 
@@ -283,13 +290,15 @@ def conn() -> sqlite3.Connection:
 
 
 @contextmanager
-def connect() -> Iterator[sqlite3.Connection]:
+def connect(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
     if _remote is not None:
         with _remote.transaction() as rc:
             yield rc  # type: ignore[misc]
         return
     c = conn()
     try:
+        if immediate and not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
         yield c
         c.commit()
     except Exception:

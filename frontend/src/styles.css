@@ -195,6 +195,15 @@ kbd { border: 1px solid var(--border-strong); border-bottom-width: 2px; border-r
 
 /* ---------- library ---------- */
 .lib-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 1.5rem; }
+.book-entry { min-width: 0; }
+.book-remove { margin-top: 0.45rem; }
+.queue-list { list-style: none; padding: 0; display: grid; gap: 0.7rem; }
+.queue-job { padding: 0.9rem 1rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.75rem; overflow-wrap: anywhere; }
+.queue-job .tag { margin-inline-start: 0.5rem; }
+.queue-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 0.5rem; }
+.study-preview { margin: 0.75rem 0; }
+.study-preview details { padding: 0.4rem 0; }
+.study-preview img { max-width: 100%; }
 .book-card { display: flex; flex-direction: column; text-decoration: none !important; color: var(--fg); border-radius: var(--radius); }
 .book-cover {
   position: relative; aspect-ratio: 3 / 4; border-radius: var(--radius); overflow: hidden;
